@@ -46,6 +46,31 @@ def test_welcome_visible_initially(window):
     assert btn is not None and btn.isVisible()
 
 
+def test_welcome_shows_brand_logo(window):
+    """The welcome card uses the brand app_icon.png, not the vector fallback."""
+    from PySide6.QtGui import QGuiApplication
+
+    from openpdfsuite.ui.components.icons import logo_pixmap
+    pm = window.welcome._logo_label.pixmap()
+    brand = logo_pixmap(56)
+    assert brand is not None, "brand asset src/openpdfsuite/resources/app_icon.png missing"
+    dpr = QGuiApplication.primaryScreen().devicePixelRatio()
+    assert pm.width() == brand.width() and pm.height() == brand.height()
+    assert pm.devicePixelRatio() == dpr
+
+
+def test_app_window_icon_is_brand(qtbot):
+    """create_app installs the brand icon on the QApplication."""
+    from PySide6.QtWidgets import QApplication
+
+    from openpdfsuite.app import create_app
+    from openpdfsuite.ui.components.icons import app_icon_path
+    assert app_icon_path() is not None
+    app = create_app([])
+    assert app is QApplication.instance()
+    assert not app.windowIcon().isNull()
+
+
 def test_document_actions_disabled_without_doc(window):
     for a in (window.action_save, window.action_undo, window.action_redo,
               window.action_find, window.action_close_doc):

@@ -8,9 +8,11 @@ Cache is invalidated when the theme changes.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
-from PySide6.QtGui import QIcon, QPainter, QPixmap
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QGuiApplication, QIcon, QPainter, QPainterPath, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 
 ICON_DIR = Path(__file__).parent.parent.parent / "resources" / "icons"
@@ -47,6 +49,59 @@ _SVGS: dict[str, str] = {
 }
 
 _cache: dict[tuple[str, str, int], QIcon] = {}
+
+# -- brand app icon -----------------------------------------------------------
+
+_APP_ICON_NAME = "app_icon.png"
+
+
+def app_icon_path() -> Path | None:
+    """Locate the brand app icon PNG for source and frozen (PyInstaller) runs."""
+    here = Path(__file__).resolve().parents[2] / "resources" / _APP_ICON_NAME
+    if here.exists():
+        return here
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        for root in (Path(getattr(sys, "_MEIPASS", "")), exe_dir,
+                     exe_dir / "_internal"):
+            cand = root / "openpdfsuite" / "resources" / _APP_ICON_NAME
+            if cand.exists():
+                return cand
+    return None
+
+
+def app_icon() -> QIcon:
+    """Brand icon for QApplication.setWindowIcon (null QIcon when missing)."""
+    p = app_icon_path()
+    return QIcon(str(p)) if p else QIcon()
+
+
+def logo_pixmap(px: int = 56, radius_ratio: float = 0.16) -> QPixmap | None:
+    """Brand logo as a rounded-corner pixmap at device resolution; None if absent."""
+    p = app_icon_path()
+    if p is None:
+        return None
+    pm = QPixmap(str(p))
+    if pm.isNull():
+        return None
+    screen = QGuiApplication.primaryScreen()
+    dpr = screen.devicePixelRatio() if screen is not None else 1.0
+    target = max(1, int(px * dpr))
+    pm = pm.scaled(target, target, Qt.AspectRatioMode.KeepAspectRatio,
+                   Qt.TransformationMode.SmoothTransformation)
+    r = int(target * radius_ratio)
+    if r > 0:
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0.0, 0.0, target, target), r, r)
+        mask = QPixmap(target, target)
+        mask.fill(Qt.GlobalColor.color0)
+        painter = QPainter(mask)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillPath(path, Qt.GlobalColor.color1)
+        painter.end()
+        pm.setMask(mask.mask())
+    pm.setDevicePixelRatio(dpr)
+    return pm
 
 
 def write_icon_files() -> None:

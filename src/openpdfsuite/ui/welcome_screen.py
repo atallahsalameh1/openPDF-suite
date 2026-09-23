@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .components.icons import logo_pixmap
 from .themes import ThemeManager
 
 
@@ -32,6 +33,7 @@ class WelcomeScreen(QWidget):
         self.setObjectName("WelcomeScreen")
         self._build()
         theme.theme_changed.connect(self._retheme)
+        self._retheme()
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
@@ -104,9 +106,13 @@ class WelcomeScreen(QWidget):
         outer.addStretch(2)
 
     def _retheme(self, *_args) -> None:
-        self._logo_label.setPixmap(
-            self.theme.icon("logo", 56, self.theme.accent_color).pixmap(56, 56)
-        )
+        logo = logo_pixmap(56)
+        if logo is not None:
+            self._logo_label.setPixmap(logo)
+        else:  # brand asset missing — fall back to the vector document mark
+            self._logo_label.setPixmap(
+                self.theme.icon("logo", 56, self.theme.accent_color).pixmap(56, 56)
+            )
         # recents icons
         for i in range(self.recents.count()):
             item = self.recents.item(i)

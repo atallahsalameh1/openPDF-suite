@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 
 from .infrastructure.logging import get_logger, setup_logging
 from .infrastructure.settings import Settings
+from .ui.components.icons import app_icon
 from .ui.main_window import MainWindow
 from .ui.themes import ThemeManager
 
@@ -42,6 +43,7 @@ def create_app(argv: list[str] | None = None) -> QApplication:
     app.setApplicationName("OpenPDFSuite")
     app.setApplicationDisplayName("openPDF suite")
     app.setOrganizationName("OpenPDFSuite")
+    app.setWindowIcon(app_icon())  # brand mark in title bar / taskbar
     app.setFont(_pick_font())
     return app
 

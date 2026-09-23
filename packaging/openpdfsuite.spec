@@ -21,7 +21,14 @@ a = Analysis(
         # default.docx.in) that python-docx loads at import time. Bundle
         # the whole docx package's data files so the template ships with
         # the executable.
+        # NOTE: no trailing comma here — `(expr,)` would make datas a
+        # 1-tuple wrapping the list and PyInstaller's unpacker rejects it
+        # (this is what broke the post-M8 packaged rebuild).
         collect_data_files("docx")
+        # brand app icon (window icon / welcome logo at runtime;
+        # resolved by ui.components.icons.app_icon_path in frozen builds)
+        + [(str(ROOT / "src" / "openpdfsuite" / "resources" / "app_icon.png"),
+            "openpdfsuite/resources")]
     ),
     hiddenimports=[
         # the PDF worker runs via multiprocessing spawn; it is imported
