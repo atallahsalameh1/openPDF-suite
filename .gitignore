@@ -1,0 +1,41 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/            # wheel/sdist output at repo root (if ever produced)
+.venv/
+venv/
+# --- Project internals (not for public repo) ---
+docs/
+AGENTS.md
+THIRD_PARTY_NOTICES.md
+
+# --- Tool caches ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Build outputs (regenerable: build.bat / PyInstaller / ISCC) ---
+# Everything under build/ is disposable: exe, installer, portable zip,
+# PyInstaller work dir, selftest PDFs and logs.
+build/
+
+# --- Qt / PySide6 local translations of user state ---
+*.qm
+
+# --- OS / editor noise ---
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.lnk
+~$*
+*.tmp
+*.openpdfsuite-tmp
+
+# --- Local settings / secrets (none should exist, but just in case) ---
+.env
+*.local.ini
+build.bat
