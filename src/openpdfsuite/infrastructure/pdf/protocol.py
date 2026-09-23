@@ -27,6 +27,7 @@ UNDO = "undo"
 REDO = "redo"
 SAVE = "save"
 SNAPSHOT = "snapshot"  # recovery: current doc bytes + revision
+EXPORT_DOCX = "export_docx"  # PDF -> DOCX side export (does not mutate the PDF)
 SHUTDOWN = "shutdown"
 
 

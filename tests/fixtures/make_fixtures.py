@@ -52,6 +52,14 @@ BG_PARA = [
     "Important notice inside the panel.",
     "White text on a solid blue background.",
 ]
+RULED_TITLE = "Ruled Table Demo"
+RULED_TABLE = [
+    ["Name", "Qty", "Price"],
+    ["Widget", "2", "10.00"],
+    ["Gadget", "1", "24.50"],
+    ["Gizmo", "5", "3.25"],
+]
+RULED_AFTER = "Paragraph after the table."
 
 
 def _new_doc() -> pymupdf.Document:
@@ -162,6 +170,35 @@ def make_tight(path: Path) -> None:
     doc.close()
 
 
+def make_ruled_table(path: Path) -> None:
+    """A real table drawn with vector rulings (find_tables target).
+
+    Also has a heading above and a paragraph below so tests can assert the
+    table claims only its own lines and the rest keeps flowing.
+    """
+    doc = _new_doc()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((72, 60), RULED_TITLE, fontsize=16, fontname="hebo")
+    x0, y0, cw, ch = 72.0, 90.0, 120.0, 22.0
+    for r, row in enumerate(RULED_TABLE):
+        for c, cell in enumerate(row):
+            page.insert_text((x0 + c * cw + 6, y0 + r * ch + 15), cell,
+                             fontsize=10, fontname="helv")
+    x1 = x0 + 3 * cw
+    for r in range(len(RULED_TABLE) + 1):
+        y = y0 + r * ch
+        page.draw_line(pymupdf.Point(x0, y), pymupdf.Point(x1, y),
+                       color=(0, 0, 0), width=0.7)
+    for c in range(4):
+        x = x0 + c * cw
+        page.draw_line(pymupdf.Point(x, y0), pymupdf.Point(x, y0 + len(RULED_TABLE) * ch),
+                       color=(0, 0, 0), width=0.7)
+    page.insert_text((72, y0 + len(RULED_TABLE) * ch + 40), RULED_AFTER,
+                     fontsize=11, fontname="helv")
+    doc.save(path)
+    doc.close()
+
+
 def make_embedded_font(path: Path) -> None:
     doc = _new_doc()
     page = doc.new_page(width=595, height=842)
@@ -205,6 +242,7 @@ BUILDERS = {
     "cropbox.pdf": make_cropbox,
     "columns.pdf": make_columns,
     "tight.pdf": make_tight,
+    "ruled_table.pdf": make_ruled_table,
     "embedded_font.pdf": make_embedded_font,
     "existing_redaction.pdf": make_existing_redaction,
 }

@@ -5,6 +5,8 @@
 import sys
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_data_files
+
 ROOT = Path(SPECPATH).parent  # project root (spec lives in packaging/)
 SRC = ROOT / "src"
 
@@ -14,7 +16,13 @@ a = Analysis(
     [str(ROOT / "packaging" / "entry.py")],
     pathex=[str(SRC)],
     binaries=[],
-    datas=[],
+    datas=(
+        # python-docx ships a default document template (default.docx +
+        # default.docx.in) that python-docx loads at import time. Bundle
+        # the whole docx package's data files so the template ships with
+        # the executable.
+        collect_data_files("docx")
+    ),
     hiddenimports=[
         # the PDF worker runs via multiprocessing spawn; it is imported
         # transitively but listed here so refactors cannot silently drop it

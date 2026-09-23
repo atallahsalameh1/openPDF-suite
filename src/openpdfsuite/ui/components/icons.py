@@ -41,6 +41,7 @@ _SVGS: dict[str, str] = {
     "chevron_left": f'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M14.5 5.5L8 12l6.5 6.5" {_S}/></svg>',
     "chevron_right": f'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M9.5 5.5L16 12l-6.5 6.5" {_S}/></svg>',
     "document": f'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M6 3h8l4 4v14H6V3Z" {_S}/><path d="M14 3v4h4" {_S}/><path d="M9 12h6M9 16h6" {_S}/></svg>',
+    "convert": f'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M5 4h9l3 3v13H5V4Z" {_S}/><path d="M8 4v4h6V4" {_S}/><path d="M9.5 13.5l3 3m0-3l-3 3" {_S}/><path d="M16.5 14.5h4v4" {_S}/><path d="M20.5 14.5l-3 3 3 3" {_S}/></svg>',
     "clock": f'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8.5" {_S}/><path d="M12 7.5V12l3 2" {_S}/></svg>',
     "logo": '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none"><rect x="6" y="4" width="30" height="40" rx="4" stroke="currentColor" stroke-width="2.4"/><path d="M14 16h14M14 24h14M14 32h8" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M30 30l6 6m0-6l-6 6" stroke="#2563EB" stroke-width="2.4" stroke-linecap="round"/></svg>',
 }

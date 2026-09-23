@@ -10,6 +10,9 @@ DocumentController (application layer) and renders the signals it emits back.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import QEventLoop, QSize, Qt, QTimer
@@ -39,7 +42,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..application.document_controller import DocumentController
-from ..domain.models import Color, EditMode, Rect, ReplacementEdit, TextAlignment
+from ..domain.models import Color, DocxExportResult, EditMode, Rect, ReplacementEdit, TextAlignment
 from ..infrastructure.logging import get_logger
 from ..infrastructure.recovery import RecoveryStore
 from ..infrastructure.settings import Settings
@@ -105,6 +108,7 @@ class MainWindow(QMainWindow):
         self._pending_edit: dict | None = None
         self._saved_once = False
         self._saving = False
+        self._converting_docx = False
         self._layout_box: tuple[int, tuple, str] | None = None
         self._insert_ctx: dict | None = None
         self._last_save_dest: str | None = None
@@ -163,6 +167,9 @@ class MainWindow(QMainWindow):
                                "Save changes to the current file")
         self.action_save_as = act("Save &As…", self._on_save_as, QKeySequence("Ctrl+Shift+S"),
                                   "Save changes to a new file")
+        self.action_convert_to_word = act(
+            "Convert to &Word…", self._on_convert_to_word, QKeySequence("Ctrl+Shift+W"),
+            "Convert the current PDF into a .docx document")
         self.action_close_doc = act("&Close Document", self._on_close_doc,
                                     QKeySequence("Ctrl+W"), "Close the current document")
         self.action_exit = act("E&xit", self.close, QKeySequence("Alt+F4"), "Quit openPDF suite")
@@ -224,7 +231,9 @@ class MainWindow(QMainWindow):
 
         self._save_actions = [self.action_save, self.action_save_as,
                               self.action_undo, self.action_redo]
-        self._doc_actions = [self.action_close_doc, self.action_find] + self._save_actions
+        self._export_actions = [self.action_convert_to_word]
+        self._doc_actions = ([self.action_close_doc, self.action_find]
+                             + self._save_actions + self._export_actions)
         self._view_actions = [self.action_zoom_in, self.action_zoom_out,
                               self.action_fit_width, self.action_fit_page]
         self._edit_tool_actions = [self.action_tool_edit, self.action_tool_add]
@@ -266,6 +275,10 @@ class MainWindow(QMainWindow):
             self.action_save_as.setToolTip(
                 "Saving…" if self._saving
                 else "Save changes to a new file (Ctrl+Shift+S)")
+            self.action_convert_to_word.setEnabled(not self._converting_docx)
+            self.action_convert_to_word.setToolTip(
+                "Converting to Word…" if self._converting_docx
+                else "Convert the current PDF to a .docx document (Ctrl+Shift+W)")
             self.action_undo.setToolTip(
                 "Undo the last edit (Ctrl+Z)" if s.can_undo else "Nothing to undo")
             self.action_redo.setToolTip(
@@ -288,6 +301,8 @@ class MainWindow(QMainWindow):
         m_file.addSeparator()
         m_file.addAction(self.action_save)
         m_file.addAction(self.action_save_as)
+        m_file.addSeparator()
+        m_file.addAction(self.action_convert_to_word)
         m_file.addSeparator()
         m_file.addAction(self.action_close_doc)
         m_file.addAction(self.action_exit)
@@ -450,6 +465,7 @@ class MainWindow(QMainWindow):
             (self.action_fit_width, "fit_width"), (self.action_fit_page, "fit_page"),
             (self.action_sidebar, "sidebar"), (self.action_properties, "properties"),
             (self.action_find, "search"),
+            (self.action_convert_to_word, "convert"),
         ]
         for action, name in pairs:
             action.setIcon(self.theme.icon(name, 18))
@@ -511,6 +527,7 @@ class MainWindow(QMainWindow):
         c.failure.connect(self._on_failure)
         c.snapshot_ready.connect(self._on_snapshot_ready)
         c.save_failed.connect(self._on_save_failed)
+        c.docx_exported.connect(self._on_docx_exported)
         c.worker_crashed.connect(self._on_worker_crashed)
         self._recovery_key = None  # fresh open: recovery keyed by doc_id
         self._update_action_availability()
@@ -996,6 +1013,94 @@ class MainWindow(QMainWindow):
         box.exec()
         return "unencrypted" if unenc is not None and box.clickedButton() is unenc \
             else "ok"
+
+    # -- export (PDF -> DOCX) --------------------------------------------------
+    def _on_convert_to_word(self) -> None:
+        if not self._has_doc() or self._saving:
+            return
+        s = self.controller.session
+        start = str(s.path) if s.path else self.settings.last_open_dir
+        # suggest a sibling .docx next to the source PDF
+        suggestion = ""
+        if s.path:
+            suggestion = str(s.path.with_suffix(".docx"))
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Convert to Word", suggestion or start,
+            "Word documents (*.docx)")
+        if not dest:
+            return
+        self._converting_docx = True
+        self._update_action_availability()
+        name = Path(dest).name
+        self.statusBar().showMessage(f"Converting {name} to Word…")
+        self.controller.export_docx(dest, self.settings.docx_options())
+
+    def _on_docx_exported(self, result: DocxExportResult) -> None:
+        self._converting_docx = False
+        self._update_action_availability()
+        path = result.output_path
+        if not path:
+            self.statusBar().showMessage("Conversion to Word failed.", 8000)
+            QMessageBox.warning(self, "Convert to Word",
+                                "The conversion did not produce a file.")
+            return
+        name = Path(path).name
+        n = len(result.unsupported_items)
+        if n:
+            msg = (f"Saved {name} — {result.pages_written} pages written; "
+                   f"{n} item(s) were skipped because Word cannot exact")
+            self.statusBar().showMessage(msg, 6000)
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Information)
+            box.setWindowTitle("Converted to Word")
+            box.setText(f"Saved {name}.")
+            box.setInformativeText(
+                f"{result.pages_written} page(s) written.\n"
+                f"{n} item(s) were skipped during conversion. "
+                "Click Show details to see what was skipped.")
+            details = "\n".join(
+                f"• Page {u.page_index + 1}: {u.message}" for u in result.unsupported_items
+            ) or "No skipped items."
+            box.setDetailedText(details)
+            open_btn = box.addButton("Open file", QMessageBox.AcceptRole)
+            folder_btn = box.addButton("Open folder", QMessageBox.ActionRole)
+            box.addButton("Close", QMessageBox.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is open_btn:
+                self._open_path_in_os(path)
+            elif clicked is folder_btn:
+                self._open_path_in_os(str(Path(path).parent))
+        else:
+            self.statusBar().showMessage(
+                f"Saved {name} — {result.pages_written} page(s) written.", 6000)
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Information)
+            box.setWindowTitle("Converted to Word")
+            box.setText(f"Saved {name}.")
+            box.setInformativeText(
+                f"{result.pages_written} page(s) written. "
+                "Open the file in Word or LibreOffice to review.")
+            open_btn = box.addButton("Open file", QMessageBox.AcceptRole)
+            folder_btn = box.addButton("Open folder", QMessageBox.ActionRole)
+            box.addButton("Close", QMessageBox.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is open_btn:
+                self._open_path_in_os(path)
+            elif clicked is folder_btn:
+                self._open_path_in_os(str(Path(path).parent))
+
+    def _open_path_in_os(self, path: str) -> None:
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except OSError as exc:
+            self.statusBar().showMessage(f"Could not open {path}: {exc}", 6000)
 
     # -- recovery (§11) -------------------------------------------------------
     def _write_recovery(self) -> None:

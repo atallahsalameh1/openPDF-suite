@@ -20,7 +20,8 @@ from dataclasses import dataclass, field
 
 import pymupdf
 
-from ...domain.models import DocumentMeta, Rect, ReplacementEdit, TextRegion
+from ...domain.models import DocumentMeta, DocxExportOptions, Rect, ReplacementEdit, TextRegion
+from ..docx.docx_writer import DocxExportError, write_docx_atomic
 from .editor import EditRecord, PdfEditEngine, PreparedEdit
 from .extractor import build_regions, extract_page_lines, page_geometry
 from .protocol import (
@@ -445,6 +446,43 @@ class PdfWorker:
                       revision=state.engine.revision, ok=True,
                       payload={"path": str(saved), "fingerprint": state.fingerprint,
                                "signed": has_signature(state.engine.doc)})
+
+    # -- export (PDF -> DOCX) --------------------------------------------------
+    def _on_export_docx(self, req: Request) -> Result:
+        """Render the open document to a .docx file. Does not mutate the PDF."""
+        from pathlib import Path as _Path
+        state = self._doc(req)
+        dest = _Path(req.payload["path"])
+        opts_payload = req.payload.get("options") or {}
+        options = DocxExportOptions(
+            embed_images=bool(opts_payload.get("embed_images", True)),
+            detect_tables=bool(opts_payload.get("detect_tables", True)),
+            detect_columns=bool(opts_payload.get("detect_columns", True)),
+            flow_mode=str(opts_payload.get("flow_mode", "formatted")),
+        )
+        try:
+            result = write_docx_atomic(state.engine.doc, options, dest)
+        except DocxExportError as exc:
+            return Result.failure(req, str(exc))
+        except FileNotFoundError as exc:
+            return Result.failure(req, f"file not found: {exc}")
+        # serialise the result so it crosses the pipe cleanly
+        return Result(request_id=req.request_id, kind=req.kind, doc_id=req.doc_id,
+                      revision=state.engine.revision, ok=True,
+                      payload={
+                          "result": {
+                              "ok": result.ok,
+                              "output_path": result.output_path,
+                              "pages_written": result.pages_written,
+                              "unsupported_items": [
+                                  {"page_index": u.page_index, "kind": u.kind,
+                                   "message": u.message}
+                                  for u in result.unsupported_items
+                              ],
+                              "warnings": list(result.warnings),
+                              "error": result.error,
+                          }
+                      })
 
 
 def region_page(region: TextRegion) -> int:

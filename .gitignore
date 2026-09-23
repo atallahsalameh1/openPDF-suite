@@ -40,3 +40,4 @@ $RECYCLE.BIN/
 *.local.ini
 build.bat
 .zcodeignore
+/.zcode

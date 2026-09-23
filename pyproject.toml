@@ -15,6 +15,7 @@ dependencies = [
     "PyMuPDF>=1.25",
     "fonttools>=4.55",
     "numpy>=2.0",
+    "python-docx>=1.1",
 ]
 
 [project.optional-dependencies]

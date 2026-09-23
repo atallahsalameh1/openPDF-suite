@@ -261,3 +261,34 @@ class DocumentMeta:
     revision: int
     fingerprint: str  # source fingerprint for recovery staleness (§11)
     title: str = ""
+
+
+@dataclass(frozen=True)
+class DocxExportOptions:
+    """Toggles for the PDF→DOCX converter (AGENTS.md §11 v1+)."""
+
+    embed_images: bool = True
+    detect_tables: bool = True
+    detect_columns: bool = True
+    flow_mode: str = "formatted"  # reserved for a future "plain" mode
+
+
+@dataclass(frozen=True)
+class UnsupportedItem:
+    """A per-page item the converter could not faithfully reproduce."""
+
+    page_index: int
+    kind: str  # "vertical_text" | "curve_text" | "missing_glyph" | "image_clipped" | ...
+    message: str
+
+
+@dataclass
+class DocxExportResult:
+    """Outcome of a PDF→DOCX conversion, surfaced to the UI."""
+
+    ok: bool = True
+    output_path: str | None = None
+    pages_written: int = 0
+    unsupported_items: list[UnsupportedItem] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    error: str | None = None

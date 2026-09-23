@@ -15,7 +15,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QPixmap
 
-from ..domain.models import ReplacementEdit, TextRegion
+from ..domain.models import DocxExportOptions, DocxExportResult, ReplacementEdit, TextRegion
 from ..infrastructure.logging import get_logger
 from ..infrastructure.pdf import protocol as P
 from .render_cache import CacheKey, RenderCache
@@ -49,6 +49,7 @@ class DocumentController(QObject):
     edit_committed = Signal(int, int)  # revision, page
     undo_redo_done = Signal(int, bool, bool, int)  # revision, can_undo, can_redo, page
     saved = Signal(str, str)  # path, fingerprint
+    docx_exported = Signal(object)  # DocxExportResult
 
     def __init__(self, cache_budget: int | None = None, parent=None):
         super().__init__(parent)
@@ -162,6 +163,22 @@ class DocumentController(QObject):
         self.client.send(P.SAVE, {"path": dest, "encryption": encryption},
                          doc_id=self.session.doc_id, revision=self.session.revision)
 
+    def export_docx(self, dest: str | Path,
+                    options: DocxExportOptions | None = None) -> None:
+        """Convert the open PDF to a .docx file. Does not mutate the PDF."""
+        assert self.session
+        opts = options or DocxExportOptions()
+        self.client.send(P.EXPORT_DOCX,
+                         {"path": str(dest),
+                          "options": {
+                              "embed_images": opts.embed_images,
+                              "detect_tables": opts.detect_tables,
+                              "detect_columns": opts.detect_columns,
+                              "flow_mode": opts.flow_mode,
+                          }},
+                         doc_id=self.session.doc_id,
+                         revision=self.session.revision)
+
     def check_source_unchanged(self) -> bool:
         """Compare the on-disk fingerprint of the source file (recovery, §11)."""
         if not self.session or not self.session.path:
@@ -198,6 +215,8 @@ class DocumentController(QObject):
             self._on_undo_redo(res)
         elif res.kind == P.SAVE:
             self._on_saved(res)
+        elif res.kind == P.EXPORT_DOCX:
+            self._on_docx_exported(res)
         elif res.kind == P.SNAPSHOT:
             if not self._stale(res):
                 self.snapshot_ready.emit(res.doc_id, res.payload.get("revision", 0),
@@ -349,3 +368,26 @@ class DocumentController(QObject):
                 "validity changed because the content was edited."
             )
         self.saved.emit(path, self.session.fingerprint)
+
+    def _on_docx_exported(self, res: P.Result) -> None:
+        if self._stale(res):
+            return
+        if not res.ok:
+            self.failure.emit(res.error or "PDF to Word conversion failed")
+            return
+        data = res.payload.get("result") or {}
+        result = DocxExportResult(
+            ok=bool(data.get("ok", True)),
+            output_path=data.get("output_path"),
+            pages_written=int(data.get("pages_written", 0)),
+            warnings=list(data.get("warnings", [])),
+            error=data.get("error"),
+        )
+        for raw in data.get("unsupported_items", []):
+            from ..domain.models import UnsupportedItem
+            result.unsupported_items.append(UnsupportedItem(
+                page_index=int(raw.get("page_index", -1)),
+                kind=str(raw.get("kind", "")),
+                message=str(raw.get("message", "")),
+            ))
+        self.docx_exported.emit(result)

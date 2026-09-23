@@ -10,6 +10,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QSettings, QStandardPaths
 
+from ..domain.models import DocxExportOptions
+
 ORG = "OpenPDFSuite"
 APP = "openPDF suite"
 MAX_RECENTS = 10
@@ -83,6 +85,23 @@ class Settings:
     @last_open_dir.setter
     def last_open_dir(self, value: str) -> None:
         self._q.setValue("files/last_open_dir", value)
+
+    # -- docx export options ---------------------------------------------------
+    def docx_options(self) -> DocxExportOptions:
+        """User-tunable PDF→DOCX options. Defaults match the v1 plan."""
+        def _b(key: str, default: bool) -> bool:
+            return str(self._q.value(f"docx/{key}", "true" if default else "false")
+                        ).lower() == "true"
+        return DocxExportOptions(
+            embed_images=_b("embed_images", True),
+            detect_tables=_b("detect_tables", True),
+            detect_columns=_b("detect_columns", True),
+            flow_mode=str(self._q.value("docx/flow_mode", "formatted")),
+        )
+
+    def set_docx_option(self, key: str, value) -> None:
+        self._q.setValue(f"docx/{key}", "true" if value else "false"
+                         if isinstance(value, bool) else str(value))
 
     # -- window geometry ------------------------------------------------------
     def save_geometry(self, key: str, data) -> None:
