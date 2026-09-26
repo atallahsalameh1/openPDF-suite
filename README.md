@@ -1,96 +1,80 @@
-# openPDF suite — PDF Text Editor for Windows
+# openPDF suite
 
-openPDF suite is a local-first Windows desktop application for editing the text of
-existing PDF files: select a line or paragraph, retype it, see a real
-PDF-engine preview, apply, undo, and save a valid PDF. No account, no
-network, no telemetry — documents never leave your machine.
+A local-first Windows desktop editor for the text of existing PDF files.
 
-## What it does
+openPDF suite opens a PDF, lets you click a line or paragraph and retype it, shows a preview rendered by the real PDF engine, and saves a clean, valid PDF. There is no account, no network, and no telemetry — documents never leave your machine.
 
-- **Open & view** — multipage PDFs via file dialog or drag-and-drop,
-  thumbnails, search with match-case, zoom / fit width / fit page,
-  continuous scrolling, copy text.
-- **Edit existing text** — in Edit Text mode, hover shows eligible regions,
-  click selects, double-click opens an in-place editor aligned to the page.
-  Replace a word, a line, or a paragraph with reflow inside a resizable box.
-- **Honest previews** — the before/after compare is rendered by the same
-  PDF engine that writes the file, not by the input widget. Font
-  substitutions and overflows are called out before anything is applied.
-- **Add text** — click an empty spot in Add Text mode.
-- **Undo/redo** (Ctrl+Z / Ctrl+Y), **crash recovery** of unsaved edits,
-  light/dark themes, high-DPI (100–200%), full keyboard access.
-- **Integrity first** — every save is written to a temp file, reopened,
-  page- and text-validated, and only then atomically replaces the target.
-  The original is never modified in place by an edit that failed
-  validation.
+| Light | Dark |
+|---|---|
+| ![openPDF suite, light theme](docs/screenshots/document-light.png) | ![openPDF suite, dark theme](docs/screenshots/document-dark.png) |
 
-## Supported editing scope (v1)
+## Features
 
-Editable today: existing horizontal text lines and conservatively grouped
-paragraphs in ordinary text PDFs, with fonts resolved from the embedded
-font, installed fonts, or an explicit substitute; colored backgrounds,
-images, and vector art behind the text are preserved.
+- **Edit existing text** — hover highlights editable regions, a click selects, a double-click opens an in-place editor aligned to the page. Replace a word, a line, or a paragraph with reflow inside a resizable box. Fonts are resolved from the embedded font, installed fonts, or an explicit substitute, with a visible notice whenever a substitution happens.
+- **Honest previews** — the before/after compare is rendered by the same PDF engine that writes the file, so what you approve is what you get. Font substitutions and text overflow are reported before anything is applied; nothing shrinks silently.
+- **Convert to Word** — export the PDF as an editable `.docx` with re-merged paragraphs, inferred alignment and spacing, real Word tables from ruled grids, and inline images at their true size.
+- **Add text** — click an empty spot and type, with the same font, preview, and validation pipeline as replacement.
+- **Integrity first** — every save is written to a temporary file, reopened, validated page-by-page (text re-extraction plus pixel comparison), and only then atomically swapped into place. A failed edit never touches the original.
+- **A real Windows app** — multipage viewing with thumbnails and search, zoom and fit modes, undo/redo, crash recovery of unsaved edits, light and dark themes, high-DPI support (100–200%), full keyboard access.
 
-Not editable (the app says so instead of guessing): scanned pages without
-a text layer, text converted to outlines, arbitrarily rotated/skewed text,
-and pages carrying pre-existing redaction marks. Digital signatures cannot
-stay valid after content changes — openPDF suite warns and asks for Save As.
+## What it does not do
+
+openPDF suite is deliberate about scope. Scanned pages (no text layer), text converted to vector outlines, and pages carrying pre-existing redaction marks are viewable but reported as not editable instead of guessed at. Digital signatures cannot remain valid after content changes — the app warns and directs you to Save As. The complete list lives in [`docs/editing-limitations.md`](docs/editing-limitations.md).
 
 ## Install
 
-1. Run `OpenPDFSuiteSetup-0.1.0.exe` (Inno Setup installer) and follow the
-   wizard, or unzip the portable `OpenPDFSuite/` folder and run
-   `OpenPDFSuite.exe`.
-2. Windows 10/11 x64. No Python or other runtime needed.
+1. Grab the latest installer or portable ZIP from [Releases](../../releases).
+2. Run `OpenPDFSuiteSetup-<version>.exe`, or unzip the portable folder and start `OpenPDFSuite.exe`.
+3. Windows 10/11 x64. No Python or other runtime required.
 
-Verify an installation headlessly (used by the packaging pipeline):
+To verify an installation headlessly:
 
 ```bat
 OpenPDFSuite.exe --selftest input.pdf output.pdf
 ```
 
-This runs open → region → edit → save → reopen-verify against the real
-engine and writes `output.pdf.selftest.log`; exit code 0 = pass.
+This runs open → select → edit → save → reopen-verify against the real engine and writes `output.pdf.selftest.log`. Exit code 0 means pass.
 
 ## Build from source
 
-Requirements: Python 3.12+, Windows 10/11 x64.
+Requirements: Windows 10/11 x64 and Python 3.12+.
 
 ```bat
+git clone https://github.com/atallahsalameh1/openPDF-suite.git
+cd openPDF-suite
+
 python -m venv .venv
 .venv\Scripts\pip install -e .[dev]
-.venv\Scripts\python tests\fixtures\make_fixtures.py   % regenerate test PDFs
-.venv\Scripts\pytest                                   % 143 tests
-.venv\Scripts\python -m openpdfsuite                          % run from source
 
-:: package
-.venv\Scripts\python scripts\make_icon.py
-.venv\Scripts\python -m PyInstaller packaging\openpdfsuite.spec --noconfirm --distpath build\dist --workpath build\pyi
-"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" packaging\openpdfsuite.iss
+:: regenerate the synthetic test PDFs
+.venv\Scripts\python tests\fixtures\make_fixtures.py
+
+:: run the test suite
+.venv\Scripts\python -m pytest
+
+:: run the app from source
+.venv\Scripts\python -m openpdfsuite
 ```
 
-Outputs:
+### Packaging
+
+```bat
+:: standalone app folder + portable ZIP + Inno Setup installer
+build.bat
+```
+
+The one-click builder checks the environment, generates the icon, builds the standalone folder with PyInstaller, zips it for portable use, and compiles the installer:
 
 | Artifact | Path |
 |---|---|
 | Standalone app folder | `build\dist\OpenPDFSuite\OpenPDFSuite.exe` |
-| Installer | `build\installer\OpenPDFSuiteSetup-0.1.0.exe` |
-| Icons | `packaging\resources\openpdfsuite.ico` |
+| Portable ZIP | `build\portable\OpenPDFSuite-Portable-<version>.zip` |
+| Installer | `build\installer\OpenPDFSuiteSetup-<version>.exe` |
 
-### One-click Windows release build
+## Architecture
 
-Double-click `build.bat`, or run it from a terminal:
-
-```bat
-build.bat
-```
-
-It checks the project virtual environment and Inno Setup, builds the standalone
-application folder, creates `build\portable\OpenPDFSuite-Portable-<version>.zip`,
-and then builds `build\installer\OpenPDFSuiteSetup-<version>.exe`.
+The codebase separates presentation (Qt widgets, theming), application (sessions, undo/redo, commands), domain (text regions, coordinates, validation models), and infrastructure (a dedicated worker process that owns all PyMuPDF access). Document mutation never happens in widget event handlers, and the UI thread never performs PDF work. Details in [`docs/decisions.md`](docs/decisions.md).
 
 ## License
 
-openPDF suite's own code is proprietary to the openPDFsuite project pending the PyMuPDF
-licensing decision (AGPL-3.0 or a commercial license from Artifex Software —
-see THIRD_PARTY_NOTICES.md, installed with the app).
+The openPDF suite source code is proprietary, pending the PyMuPDF licensing decision (AGPL-3.0 or a commercial license from Artifex Software). Dependency licenses and redistribution terms are catalogued in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), which is also installed with the app.
