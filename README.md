@@ -4,10 +4,6 @@ A local-first Windows desktop editor for the text of existing PDF files.
 
 openPDF suite opens a PDF, lets you click a line or paragraph and retype it, shows a preview rendered by the real PDF engine, and saves a clean, valid PDF. There is no account, no network, and no telemetry — documents never leave your machine.
 
-| Light | Dark |
-|---|---|
-| ![openPDF suite, light theme](docs/screenshots/document-light.png) | ![openPDF suite, dark theme](docs/screenshots/document-dark.png) |
-
 ## Features
 
 - **Edit existing text** — hover highlights editable regions, a click selects, a double-click opens an in-place editor aligned to the page. Replace a word, a line, or a paragraph with reflow inside a resizable box. Fonts are resolved from the embedded font, installed fonts, or an explicit substitute, with a visible notice whenever a substitution happens.
@@ -19,7 +15,7 @@ openPDF suite opens a PDF, lets you click a line or paragraph and retype it, sho
 
 ## What it does not do
 
-openPDF suite is deliberate about scope. Scanned pages (no text layer), text converted to vector outlines, and pages carrying pre-existing redaction marks are viewable but reported as not editable instead of guessed at. Digital signatures cannot remain valid after content changes — the app warns and directs you to Save As. The complete list lives in [`docs/editing-limitations.md`](docs/editing-limitations.md).
+openPDF suite is deliberate about scope. Scanned pages (no text layer), text converted to vector outlines, and pages carrying pre-existing redaction marks are viewable but reported as not editable instead of guessed at. Digital signatures cannot remain valid after content changes — the app warns and directs you to Save As.
 
 ## Install
 
@@ -59,22 +55,23 @@ python -m venv .venv
 ### Packaging
 
 ```bat
-:: standalone app folder + portable ZIP + Inno Setup installer
-build.bat
-```
+:: standalone app folder
+.venv\Scripts\python scripts\make_icon.py
+.venv\Scripts\python -m PyInstaller packaging\openpdfsuite.spec --noconfirm
 
-The one-click builder checks the environment, generates the icon, builds the standalone folder with PyInstaller, zips it for portable use, and compiles the installer:
+:: installer (requires Inno Setup 6)
+iscc packaging\openpdfsuite.iss
+```
 
 | Artifact | Path |
 |---|---|
 | Standalone app folder | `build\dist\OpenPDFSuite\OpenPDFSuite.exe` |
-| Portable ZIP | `build\portable\OpenPDFSuite-Portable-<version>.zip` |
 | Installer | `build\installer\OpenPDFSuiteSetup-<version>.exe` |
 
 ## Architecture
 
-The codebase separates presentation (Qt widgets, theming), application (sessions, undo/redo, commands), domain (text regions, coordinates, validation models), and infrastructure (a dedicated worker process that owns all PyMuPDF access). Document mutation never happens in widget event handlers, and the UI thread never performs PDF work. Details in [`docs/decisions.md`](docs/decisions.md).
+The codebase separates presentation (Qt widgets, theming), application (sessions, undo/redo, commands), domain (text regions, coordinates, validation models), and infrastructure (a dedicated worker process that owns all PyMuPDF access). Document mutation never happens in widget event handlers, and the UI thread never performs PDF work.
 
 ## License
 
-The openPDF suite source code is proprietary, pending the PyMuPDF licensing decision (AGPL-3.0 or a commercial license from Artifex Software). Dependency licenses and redistribution terms are catalogued in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), which is also installed with the app.
+The openPDF suite source code is proprietary, pending the PyMuPDF licensing decision (AGPL-3.0 or a commercial license from Artifex Software). Dependency licenses and redistribution terms are catalogued in the third-party notices document distributed with the application.
