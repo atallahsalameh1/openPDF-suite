@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..domain.models import TextRegion
+from ..domain.coordinates import PageTransform
+from ..domain.models import Point, Rect, TextRegion
 from .themes import ThemeManager
 
 PAGE_MARGIN = 14  # px around each page (4/8 scale: 14 ≈ 8+6 visual gutter)
@@ -90,16 +91,18 @@ class PageFrame(QWidget):
             painter.drawText(pr, Qt.AlignCenter,
                              "Loading…" if self.state == "loading" else "Page failed to render")
 
-        # search highlights
-        for rect in self.view.search_highlights.get(self.index, ()):  # page-space pts
-            r = QRectF(pr.x() + rect[0] * self.zoom, pr.y() + rect[1] * self.zoom,
-                       rect[2] * self.zoom, rect[3] * self.zoom)
+        # search highlights (engine space -> display space)
+        for rect in self.view.search_highlights.get(self.index, ()):  # engine pts
+            r = self.view.rect_to_display(self.index, Rect(*rect))
+            r = QRectF(pr.x() + r.x0 * self.zoom, pr.y() + r.y0 * self.zoom,
+                       r.width * self.zoom, r.height * self.zoom)
             painter.fillRect(r, QColor(255, 200, 0, 90))
 
-        # copy-selection highlight
+        # copy-selection highlight (engine space -> display space)
         for rect in self.view.selection_rects.get(self.index, ()):
-            r = QRectF(pr.x() + rect[0] * self.zoom, pr.y() + rect[1] * self.zoom,
-                       rect[2] * self.zoom, rect[3] * self.zoom)
+            er = self.view.rect_to_display(self.index, Rect(*rect))
+            r = QRectF(pr.x() + er.x0 * self.zoom, pr.y() + er.y0 * self.zoom,
+                       er.width * self.zoom, er.height * self.zoom)
             sel_color = QColor(t.accent)
             sel_color.setAlpha(60)
             painter.fillRect(r, sel_color)
@@ -110,8 +113,9 @@ class PageFrame(QWidget):
         # edit-mode hover outline (gray when the engine cannot edit it)
         hover = self.view.hover_region_rect
         if self.view.mode == "edit" and hover and hover[0] == self.index:
-            r = QRectF(pr.x() + hover[1][0] * self.zoom, pr.y() + hover[1][1] * self.zoom,
-                       hover[1][2] * self.zoom, hover[1][3] * self.zoom)
+            er = self.view.rect_to_display(self.index, Rect(*hover[1]))
+            r = QRectF(pr.x() + er.x0 * self.zoom, pr.y() + er.y0 * self.zoom,
+                       er.width * self.zoom, er.height * self.zoom)
             pen = painter.pen()
             pen.setColor(QColor(t.accent) if len(hover) < 3 or hover[2]
                          else QColor("#98A2B3"))
@@ -122,8 +126,9 @@ class PageFrame(QWidget):
         # selected-region outline (thicker, accent-filled tint)
         sel = self.view.selected_region_rect
         if self.view.mode == "edit" and sel and sel[0] == self.index:
-            r = QRectF(pr.x() + sel[1][0] * self.zoom, pr.y() + sel[1][1] * self.zoom,
-                       sel[1][2] * self.zoom, sel[1][3] * self.zoom)
+            er = self.view.rect_to_display(self.index, Rect(*sel[1]))
+            r = QRectF(pr.x() + er.x0 * self.zoom, pr.y() + er.y0 * self.zoom,
+                       er.width * self.zoom, er.height * self.zoom)
             tint = QColor(t.accent)
             tint.setAlpha(36)
             painter.fillRect(r, tint)
@@ -137,9 +142,9 @@ class PageFrame(QWidget):
         # layout box (Mode B target): dashed outline + resize handles
         lay = self.view.layout_box_rect
         if self.view.mode in ("edit", "add") and lay and lay[0] == self.index:
-            b = lay[1]
-            r = QRectF(pr.x() + b[0] * self.zoom, pr.y() + b[1] * self.zoom,
-                       (b[2] - b[0]) * self.zoom, (b[3] - b[1]) * self.zoom)
+            er = self.view.rect_to_display(self.index, Rect(*lay[1]))
+            r = QRectF(pr.x() + er.x0 * self.zoom, pr.y() + er.y0 * self.zoom,
+                       er.width * self.zoom, er.height * self.zoom)
             pen = painter.pen()
             pen.setColor(QColor(t.accent))
             pen.setStyle(Qt.DashLine)
@@ -150,7 +155,7 @@ class PageFrame(QWidget):
             pen.setStyle(Qt.SolidLine)
             painter.setPen(pen)
             handle_brush = QColor(t.accent)
-            for hx, hy in self.view.box_handles(b):
+            for hx, hy in self.view.box_handles((er.x0, er.y0, er.x1, er.y1)):
                 px = pr.x() + hx * self.zoom
                 py = pr.y() + hy * self.zoom
                 painter.fillRect(QRectF(px - 4, py - 4, 8, 8), QColor(t.bg_panel))
@@ -204,6 +209,7 @@ class DocumentView(QScrollArea):
         self.viewport().setAttribute(Qt.WA_StyledBackground, True)
         self.frames: list[PageFrame] = []
         self.mode = "select"  # select | edit | add
+        self.page_rotations: list[int] = []  # per-page /Rotate from the worker
         self.search_highlights: dict[int, list[tuple]] = {}
         self.selection_rects: dict[int, list[tuple]] = {}
         self.selected_text = ""
@@ -225,8 +231,10 @@ class DocumentView(QScrollArea):
         theme.theme_changed.connect(lambda *_: self.viewport().update())
 
     # -- document lifecycle ------------------------------------------------
-    def set_document(self, page_sizes: list[tuple[float, float]]) -> None:
+    def set_document(self, page_sizes: list[tuple[float, float]],
+                     rotations: list[int] | None = None) -> None:
         self.clear_document()
+        self.page_rotations = list(rotations or [])
         for i, size in enumerate(page_sizes):
             frame = PageFrame(i, size, self)
             self.frames.append(frame)
@@ -245,6 +253,7 @@ class DocumentView(QScrollArea):
             self.layout.removeWidget(frame)
             frame.deleteLater()
         self.frames.clear()
+        self.page_rotations = []
         self.page_lines.clear()
         self.page_regions.clear()
         self.search_highlights.clear()
@@ -255,6 +264,38 @@ class DocumentView(QScrollArea):
     def _dpr(self) -> float:
         screen = self.screen() or QApplication.primaryScreen()
         return screen.devicePixelRatio() if screen else 1.0
+
+    # -- engine <-> display space (AGENTS.md §8) --------------------------------
+    # Engine geometry (regions, lines, layout boxes — everything the worker
+    # sends) lives in PyMuPDF's unrotated, crop-normal page space. The canvas
+    # shows the rotated rendering, so `map_to_page` (mouse on the pixmap)
+    # yields DISPLAY coordinates. Every crossing between the two goes through
+    # PageTransform here; at rotation 0 both spaces are identical.
+    def _page_tf(self, index: int) -> PageTransform:
+        if not 0 <= index < len(self.frames):
+            raise IndexError(index)
+        w, h = self.frames[index].size_pt  # display dims
+        rot = self.page_rotations[index] if index < len(self.page_rotations) else 0
+        uw, uh = (h, w) if rot in (90, 270) else (w, h)  # unrotated dims
+        return PageTransform(crop_x0=0.0, crop_y0=0.0, crop_w=uw, crop_h=uh,
+                             rotation=rot)
+
+    def rect_to_display(self, page: int, rect: Rect) -> Rect:
+        """Engine-space rect -> display-space rect (for painting)."""
+        return self._page_tf(page).rect_to_page(rect)
+
+    def rect_to_engine(self, page: int, rect: Rect) -> Rect:
+        """Display-space rect -> engine-space rect (hit tests)."""
+        return self._page_tf(page).rect_to_user(rect)
+
+    def point_to_engine(self, page: int, x: float, y: float) -> Point:
+        """Display-space point -> engine-space point (mouse)."""
+        return self._page_tf(page).to_user(Point(x, y))
+
+    def page_size_engine(self, page: int) -> tuple[float, float]:
+        """(width, height) of the page in engine (unrotated) space."""
+        tf = self._page_tf(page)
+        return tf.crop_w, tf.crop_h
 
     # -- zoom -----------------------------------------------------------------
     @property
@@ -414,7 +455,8 @@ class DocumentView(QScrollArea):
         px = frame.map_to_page(pos)
         if px is None:
             return None
-        x, y = px.x(), px.y()
+        pt = self.point_to_engine(frame.index, px.x(), px.y())
+        x, y = pt.x, pt.y
         for name, (hx, hy) in zip(self._HANDLES, self.box_handles(lay[1]), strict=True):
             if abs(x - hx) <= tol and abs(y - hy) <= tol:
                 return name
@@ -427,8 +469,9 @@ class DocumentView(QScrollArea):
         px = frame.map_to_page(pos)
         if px is None:
             return False
+        pt = self.point_to_engine(frame.index, px.x(), px.y())
         x0, y0, x1, y1 = lay[1]
-        return x0 <= px.x() <= x1 and y0 <= px.y() <= y1
+        return x0 <= pt.x <= x1 and y0 <= pt.y <= y1
 
     _HANDLE_CURSORS = {
         "tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor,
@@ -500,14 +543,16 @@ class DocumentView(QScrollArea):
         elif self.mode == "edit":
             handle = self._handle_at(frame, event.position().toPoint())
             if handle is not None and self.layout_box_rect:
+                mpp = frame.map_to_page(event.position().toPoint())
                 self._box_drag = {"op": "resize", "handle": handle,
-                                  "start": frame.map_to_page(event.position().toPoint()),
+                                  "start": self.point_to_engine(frame.index, mpp.x(), mpp.y()),
                                   "orig": self.layout_box_rect[1],
                                   "page": frame.index}
                 return
             if self._inside_layout_box(frame, event.position().toPoint()):
+                mpp = frame.map_to_page(event.position().toPoint())
                 self._box_drag = {"op": "move",
-                                  "start": frame.map_to_page(event.position().toPoint()),
+                                  "start": self.point_to_engine(frame.index, mpp.x(), mpp.y()),
                                   "orig": self.layout_box_rect[1],
                                   "page": frame.index}
                 return
@@ -517,8 +562,8 @@ class DocumentView(QScrollArea):
         elif self.mode == "add":
             page_pos = frame.map_to_page(event.position().toPoint())
             if page_pos is not None:
-                self.add_text_requested.emit(
-                    frame.index, float(page_pos.x()), float(page_pos.y()))
+                pt = self.point_to_engine(frame.index, page_pos.x(), page_pos.y())
+                self.add_text_requested.emit(frame.index, float(pt.x), float(pt.y))
 
     def _frame_mouse_move(self, frame: PageFrame, event) -> None:
         if self.mode == "select" and self._drag_start is not None:
@@ -549,10 +594,12 @@ class DocumentView(QScrollArea):
         if px is None:
             return
         drag = self._box_drag
+        cur = self.point_to_engine(frame.index, px.x(), px.y())
         x0, y0, x1, y1 = drag["orig"]
-        dx = px.x() - drag["start"].x()
-        dy = px.y() - drag["start"].y()
-        page_w, page_h = frame.size_pt
+        dx = cur.x - drag["start"].x
+        dy = cur.y - drag["start"].y
+        tf = self._page_tf(frame.index)
+        page_w, page_h = tf.crop_w, tf.crop_h  # engine-space page dims
         min_size = 12.0
         if drag["op"] == "move":
             w, h = x1 - x0, y1 - y0
@@ -603,7 +650,10 @@ class DocumentView(QScrollArea):
         if page_pos is None:
             return None
         regions = self.page_regions.get(frame.index, [])
-        x, y = page_pos.x(), page_pos.y()
+        # region bboxes are engine space; the mouse is on the rendered
+        # (display) pixmap — compare in engine space
+        pt = self.point_to_engine(frame.index, page_pos.x(), page_pos.y())
+        x, y = pt.x, pt.y
         # prefer the tightest containing line region; paragraph regions are the fallback
         best_line = None
         best_para = None
@@ -623,12 +673,14 @@ class DocumentView(QScrollArea):
             return
         x0, y0 = start.x(), start.y()
         x1, y1 = page_pos.x(), page_pos.y()
-        sel = QRectF(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y1)).adjusted(
-            -2, -2, 2, 2)
+        slop = 2.0 / frame.zoom  # 2 screen px, constant on screen
+        disp = Rect(min(x0, x1) - slop, min(y0, y1) - slop,
+                    max(x0, x1) + slop, max(y0, y1) + slop)
+        sel = self.rect_to_engine(frame.index, disp)
         rects: list[tuple] = []
         texts: list[str] = []
         for text, bbox, _baseline in self.page_lines.get(frame.index, []):
-            r = QRectF(*bbox)
+            r = Rect(*bbox)
             if r.intersects(sel):
                 rects.append(bbox)
                 texts.append(text)

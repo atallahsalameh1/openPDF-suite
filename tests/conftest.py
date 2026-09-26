@@ -76,3 +76,17 @@ def ruled_table_pdf(fixture_dir, tmp_path) -> Path:
     dst = tmp_path / "ruled_table_copy.pdf"
     dst.write_bytes((fixture_dir / "ruled_table.pdf").read_bytes())
     return dst
+
+
+@pytest.fixture()
+def wrapped_table_pdf(fixture_dir, tmp_path) -> Path:
+    dst = tmp_path / "wrapped_table_copy.pdf"
+    dst.write_bytes((fixture_dir / "wrapped_table.pdf").read_bytes())
+    return dst
+
+
+@pytest.fixture()
+def rotated_pdf(fixture_dir, tmp_path) -> Path:
+    dst = tmp_path / "rotated_copy.pdf"
+    dst.write_bytes((fixture_dir / "rotated.pdf").read_bytes())
+    return dst

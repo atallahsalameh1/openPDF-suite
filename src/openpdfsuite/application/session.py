@@ -19,6 +19,7 @@ class DocumentSession:
     doc_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     meta: DocumentMeta | None = None
     page_sizes: list[tuple[float, float]] = field(default_factory=list)
+    page_rotations: list[int] = field(default_factory=list)  # per-page /Rotate (0/90/180/270)
     revision: int = 0
     saved_revision: int = 0  # revision at last successful save
     dirty: bool = False

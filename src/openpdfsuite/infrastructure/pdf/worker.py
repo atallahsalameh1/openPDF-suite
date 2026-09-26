@@ -108,7 +108,8 @@ class PdfWorker:
                                "page_sizes": [
                                    (page_geometry(p).width, page_geometry(p).height)
                                    for p in doc
-                               ]})
+                               ],
+                               "rotations": [page_geometry(p).rotation for p in doc]})
 
     def _open_bytes(self, req: Request, data: bytes, password: str) -> Result:
         """Open a recovered session: bytes are the edited document; `source_path`
@@ -139,7 +140,8 @@ class PdfWorker:
                                "page_sizes": [
                                    (page_geometry(p).width, page_geometry(p).height)
                                    for p in doc
-                               ]})
+                               ],
+                               "rotations": [page_geometry(p).rotation for p in doc]})
 
     def _on_snapshot(self, req: Request) -> Result:
         state = self._doc(req)
@@ -170,7 +172,8 @@ class PdfWorker:
                                "page_sizes": [
                                    (page_geometry(p).width, page_geometry(p).height)
                                    for p in doc
-                               ]})
+                               ],
+                               "rotations": [page_geometry(p).rotation for p in doc]})
 
     def _meta(self, state: _DocState, doc_id: str) -> DocumentMeta:
         doc = state.engine.doc

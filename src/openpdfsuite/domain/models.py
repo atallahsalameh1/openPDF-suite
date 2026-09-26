@@ -160,6 +160,7 @@ class TextRegion:
     paragraph_box: Rect | None = None  # explicit reflow rect for Mode B
     editable: bool = True  # engine capability, attached at extraction time
     unsupported_reason: str = ""  # human-readable when not editable
+    grouping_reason: str = ""  # why this line was not merged into a paragraph
 
     @property
     def text(self) -> str:

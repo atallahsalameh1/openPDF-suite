@@ -241,10 +241,12 @@ class DocumentController(QObject):
             return
         meta = res.payload["meta"]
         page_sizes = [tuple(s) for s in res.payload.get("page_sizes", [])]
+        page_rotations = [int(r) for r in res.payload.get("rotations", [])]
         self.session = DocumentSession(path=Path(meta.path) if meta.path else None)
         self.session.doc_id = meta.doc_id
         self.session.meta = meta
         self.session.page_sizes = page_sizes
+        self.session.page_rotations = page_rotations
         self.session.revision = meta.revision
         self.session.fingerprint = meta.fingerprint
         if res.payload.get("restored"):

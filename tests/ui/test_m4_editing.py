@@ -49,8 +49,12 @@ def drag_bottom_handle(w, new_bottom_pt):
     mid_x = (orig[0] + orig[2]) / 2
     start = QPoint(int(PAGE_MARGIN + mid_x * frame.zoom),
                    int(PAGE_MARGIN + orig[3] * frame.zoom))
-    w.view._box_drag = {"op": "resize", "handle": "b",
-                        "start": frame.map_to_page(start), "orig": orig, "page": 0}
+    start_disp = frame.map_to_page(start)
+    w.view._box_drag = {
+        "op": "resize", "handle": "b",
+        # drag start is engine space (what the mouse-press handler builds)
+        "start": w.view.point_to_engine(0, start_disp.x(), start_disp.y()),
+        "orig": orig, "page": 0}
     target = QPoint(int(PAGE_MARGIN + mid_x * frame.zoom),
                     int(PAGE_MARGIN + new_bottom_pt * frame.zoom))
     w.view._update_box_drag(frame, target)

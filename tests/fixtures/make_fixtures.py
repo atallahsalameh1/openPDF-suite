@@ -61,6 +61,18 @@ RULED_TABLE = [
 ]
 RULED_AFTER = "Paragraph after the table."
 
+# Wrapped-cell table: columns 1 and 2 repeat across rows and column 3 wraps to
+# two physical lines, i.e. the invoice layout that used to collapse every row
+# into one giant "paragraph" region.
+WRAPPED_ROW_ACCOUNT = "701000 Sales of Merchandises"
+WRAPPED_ROW_PARTNER = "M/S Fresh Mart"
+WRAPPED_CELL_R1 = "[HERO104] HERO HONEY 28.3GR"
+WRAPPED_CELL_R2_A = "[HERO107] HERO STRAWBERRY JAM MINI"
+WRAPPED_CELL_R2_B = "28.3G (1OZ)*144 - 144*ea"
+WRAPPED_CELL_R3 = "[HERO108] HERO APRICOT JAM MINI"
+WRAPPED_TITLE = "Wrapped Cell Table Demo"
+WRAPPED_AFTER = "Paragraph after the wrapped table."
+
 
 def _new_doc() -> pymupdf.Document:
     return pymupdf.open()
@@ -199,6 +211,53 @@ def make_ruled_table(path: Path) -> None:
     doc.close()
 
 
+def make_wrapped_table_cell(path: Path) -> None:
+    """A ruled table where row 2's third cell wraps onto two physical lines.
+
+    Rows repeat identical text in columns 1-2, so every consecutive row pair
+    passes the pair-local gap/overlap/font tests — the pattern that made
+    `group_paragraphs` collapse the whole table into one region. Row 2's
+    wrapped cell is a genuine 2-line paragraph inside one cell and must still
+    be groupable, so the fix cannot simply reject everything.
+    """
+    doc = _new_doc()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((60, 60), WRAPPED_TITLE, fontsize=16, fontname="hebo")
+
+    x0, y0, cw = 60.0, 80.0, 150.0
+    row_h = [26.0, 40.0, 26.0]  # row 2 is taller to hold the wrapped cell
+    rows = [
+        [(WRAPPED_ROW_ACCOUNT, WRAPPED_ROW_PARTNER, WRAPPED_CELL_R1)],
+        [(WRAPPED_ROW_ACCOUNT, WRAPPED_ROW_PARTNER,
+          (WRAPPED_CELL_R2_A, WRAPPED_CELL_R2_B))],
+        [(WRAPPED_ROW_ACCOUNT, WRAPPED_ROW_PARTNER, WRAPPED_CELL_R3)],
+    ]
+    tops = [y0]
+    for h in row_h:
+        tops.append(tops[-1] + h)
+
+    for r, row in enumerate(rows):
+        for c, cell in enumerate(row[0]):
+            cx = x0 + c * cw + 6
+            cy = tops[r] + 15
+            lines = cell if isinstance(cell, tuple) else (cell,)
+            for i, text in enumerate(lines):
+                page.insert_text((cx, cy + i * 14), text, fontsize=10, fontname="helv")
+
+    x1 = x0 + 3 * cw
+    for y in tops:
+        page.draw_line(pymupdf.Point(x0, y), pymupdf.Point(x1, y),
+                       color=(0, 0, 0), width=0.7)
+    for c in range(4):
+        x = x0 + c * cw
+        page.draw_line(pymupdf.Point(x, y0), pymupdf.Point(x, tops[-1]),
+                       color=(0, 0, 0), width=0.7)
+
+    page.insert_text((60, tops[-1] + 40), WRAPPED_AFTER, fontsize=11, fontname="helv")
+    doc.save(path)
+    doc.close()
+
+
 def make_embedded_font(path: Path) -> None:
     doc = _new_doc()
     page = doc.new_page(width=595, height=842)
@@ -243,6 +302,7 @@ BUILDERS = {
     "columns.pdf": make_columns,
     "tight.pdf": make_tight,
     "ruled_table.pdf": make_ruled_table,
+    "wrapped_table.pdf": make_wrapped_table_cell,
     "embedded_font.pdf": make_embedded_font,
     "existing_redaction.pdf": make_existing_redaction,
 }

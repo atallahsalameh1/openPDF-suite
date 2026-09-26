@@ -18,6 +18,12 @@ never auto-applied unless the edit opts in.
 Validation splits the page into "changed" and "unchanged" using the union of
 the source region box and the expected insertion extent, so legitimate edits
 that are wider/taller than the source are not falsely rejected.
+
+Coordinate spaces: region/line geometry (extraction) and all content-stream
+calls (add_redact_annot, insert_text*) share PyMuPDF's unrotated, crop-normal
+page space. Pixmaps render the rotated display space, so every rect fed to
+pixel validation is first mapped through `page.rotation_matrix` (identity at
+rotation 0).
 """
 
 from __future__ import annotations
@@ -375,7 +381,8 @@ class PdfEditEngine:
                     matrix=pymupdf.Matrix(preview_zoom, preview_zoom))
                 after = candidate[page_index].get_pixmap(
                     matrix=pymupdf.Matrix(preview_zoom, preview_zoom))
-                self._validate_pixels(before, after, padded, preview_zoom, validation)
+                self._validate_pixels(before, after, self._display_rect(page_index, padded),
+                                      preview_zoom, validation)
                 before_png = before.tobytes("png")
 
             if not validation.ok:
@@ -517,7 +524,8 @@ class PdfEditEngine:
                     matrix=pymupdf.Matrix(preview_zoom, preview_zoom))
                 after = candidate[page_index].get_pixmap(
                     matrix=pymupdf.Matrix(preview_zoom, preview_zoom))
-                self._validate_pixels(before, after, padded, preview_zoom, validation)
+                self._validate_pixels(before, after, self._display_rect(page_index, padded),
+                                      preview_zoom, validation)
                 before_png = before.tobytes("png")
             if not validation.ok:
                 candidate.close()
@@ -565,6 +573,13 @@ class PdfEditEngine:
         return self.revision
 
     # -- validation ---------------------------------------------------------------
+    def _display_rect(self, page_index: int, rect: Rect) -> Rect:
+        """Engine space -> display space: pixmaps render the rotated page, so a
+        rect used to mask pixel diffs must go through `rotation_matrix`
+        (identity at rotation 0)."""
+        r = _to_mupdf_rect(rect) * self.doc[page_index].rotation_matrix
+        return Rect(r.x0, r.y0, r.x1, r.y1)
+
     def _validate_extraction(
         self, cand_page: pymupdf.Page, page_index: int, region: TextRegion,
         edit: ReplacementEdit, padded: Rect, validation: ValidationResult,

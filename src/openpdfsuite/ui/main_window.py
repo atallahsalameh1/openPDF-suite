@@ -557,7 +557,7 @@ class MainWindow(QMainWindow):
         self.view.region_double_clicked.connect(self._on_region_double_clicked)
         self.view.region_box_changed.connect(self._on_region_box_changed)
         self.view.add_text_requested.connect(self._on_add_text_requested)
-        self.view.set_document(page_sizes)
+        self.view.set_document(page_sizes, c.session.page_rotations)
 
         self.sidebar_tabs.thumbnails.set_page_count(meta.page_count)
         c.request_thumbnails(list(range(meta.page_count)))
@@ -702,6 +702,9 @@ class MainWindow(QMainWindow):
         else:
             self._layout_box = None
             self.view.set_layout_box(None, None)
+            if region.grouping_reason:
+                self.statusBar().showMessage(
+                    f"Selected “{shown}” — {region.grouping_reason}", 8000)
 
     def _on_region_double_clicked(self, page: int, region) -> None:
         if not region.editable:
@@ -748,9 +751,12 @@ class MainWindow(QMainWindow):
         self._close_overlay()
         frame = self.view.frames[page]
         pr = frame.page_rect()
-        ox = (frame.x() + pr.x() + region.bbox.x0 * frame.zoom
+        # the overlay floats over the rendered page (display space); region
+        # geometry is engine space
+        disp = self.view.rect_to_display(page, region.bbox)
+        ox = (frame.x() + pr.x() + disp.x0 * frame.zoom
               - self.view.horizontalScrollBar().value())
-        oy = (frame.y() + pr.y() + region.bbox.y0 * frame.zoom
+        oy = (frame.y() + pr.y() + disp.y0 * frame.zoom
               - self.view.verticalScrollBar().value())
         dom = region.dominant_font
         multiline = region.mode == EditMode.REFLOW_BOX
@@ -762,7 +768,7 @@ class MainWindow(QMainWindow):
             text = region.text
         overlay = TextOverlay(
             self.view.viewport(), self.theme, ox, oy,
-            max(region.bbox.width * frame.zoom, 200),
+            max(disp.width * frame.zoom, 200),
             text, dom.family, dom.size * frame.zoom, multiline=multiline)
         overlay.applied.connect(self._submit_edit)
         overlay.cancelled.connect(self._on_overlay_cancelled)
@@ -892,11 +898,12 @@ class MainWindow(QMainWindow):
                 "pixel validation. Apply it?") == QMessageBox.Yes
         region = pending.get("region")
         if region is not None:
-            box = region.bbox
+            # the preview dialog highlights on rendered (display) images
+            box = self.view.rect_to_display(pending["page"], region.bbox)
             pad_x = max(10.0, box.width * 0.4)
         else:
             x0, y0, x1, y1 = pending["box"]
-            box = Rect(x0, y0, x1, y1)
+            box = self.view.rect_to_display(pending["page"], Rect(x0, y0, x1, y1))
             pad_x = 10.0
         changed = Rect(box.x0 - 8, box.y0 - 5, box.x1 + pad_x, box.y1 + 5)
         dlg = PreviewDialog(self, self.theme, before_png, after_png, changed,
@@ -1218,17 +1225,21 @@ class MainWindow(QMainWindow):
         if self.view is None or not (0 <= page < len(self.view.frames)):
             return
         self._close_overlay()
-        # default box: 260 pt wide, 3 lines tall, top-left at the click
-        box = (x_pt, y_pt, min(x_pt + 260.0, self.view.frames[page].size_pt[0] - 36.0),
-               y_pt + 48.0)
+        # default box: 260 pt wide, 3 lines tall, top-left at the click.
+        # The click arrives in engine space; clamp against engine page dims.
+        ew, _eh = self.view.page_size_engine(page)
+        box = (x_pt, y_pt, min(x_pt + 260.0, ew - 36.0), y_pt + 48.0)
         self._insert_ctx = {"page": page, "box": box}
         self.view.set_layout_box(page, box)
         self.properties.show_style("Helvetica", 11.0, False, False, "#000000", "")
         self._style_overrides = {}
+        # the overlay floats over the rendered page: display-space position
+        disp = self.view.rect_to_display(page, Rect(*box))
+        frame = self.view.frames[page]
         overlay = TextOverlay(
             self.view.viewport(), self.theme,
-            self.view.frames[page].x() + 20, self.view.frames[page].y()
-            + box[1] * self.view.frames[page].zoom
+            frame.x() + 20, frame.y()
+            + disp.y0 * frame.zoom
             - self.view.verticalScrollBar().value(),
             280, "", "Helvetica", 11.0 * self.view.zoom, multiline=True)
         overlay.applied.connect(self._submit_insert)

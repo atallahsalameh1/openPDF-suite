@@ -12,6 +12,13 @@ from openpdfsuite.infrastructure.pdf.extractor import (
     extract_page_lines,
     group_paragraphs,
 )
+from tests.fixtures.make_fixtures import (
+    WRAPPED_AFTER,
+    WRAPPED_CELL_R1,
+    WRAPPED_CELL_R2_A,
+    WRAPPED_CELL_R2_B,
+    WRAPPED_CELL_R3,
+)
 
 
 @pytest.fixture()
@@ -91,3 +98,85 @@ def test_region_ids_unique_per_page(para_doc):
     regions = build_regions(para_doc[0], "docA", 0)
     ids = [r.region_id for r in regions]
     assert len(ids) == len(set(ids)), "region ids must be unique"
+
+
+# -- table rows must not collapse into one paragraph -------------------------
+
+
+def test_identical_table_rows_do_not_merge(wrapped_table_pdf):
+    """Regression: repeating cells + even spacing used to merge every row.
+
+    Columns 1-2 repeat the same text and the rows are evenly spaced, so each
+    consecutive pair passed the pair-local gap/overlap/font tests and the whole
+    table became one giant REFLOW_BOX.
+    """
+    doc = pymupdf.open(str(wrapped_table_pdf))
+    regions = build_regions(doc[0], "d", 0)
+    paras = [r for r in regions if r.mode == EditMode.REFLOW_BOX]
+    for para in paras:
+        text = para.text
+        # no paragraph may span two different data rows
+        assert not (WRAPPED_CELL_R1 in text and WRAPPED_CELL_R2_A in text), \
+            "row 1 and row 2 merged into one region"
+        assert not (WRAPPED_CELL_R2_A in text and WRAPPED_CELL_R3 in text), \
+            "row 2 and row 3 merged into one region"
+        assert WRAPPED_AFTER not in text, "trailing paragraph merged into the table"
+    doc.close()
+
+
+def test_wrapped_cell_lines_still_merge(wrapped_table_pdf):
+    """The fix must not over-reject: a cell wrapping onto two lines is a
+    genuine paragraph and still groups."""
+    doc = pymupdf.open(str(wrapped_table_pdf))
+    regions = build_regions(doc[0], "d", 0)
+    paras = [r for r in regions if r.mode == EditMode.REFLOW_BOX]
+    wrapped = [r for r in paras if WRAPPED_CELL_R2_A in r.text]
+    assert wrapped, "the wrapped cell lines should still form a paragraph"
+    assert WRAPPED_CELL_R2_B in wrapped[0].text, "both wrapped lines must be grouped"
+    doc.close()
+
+
+def test_table_lines_carry_grouping_reason(wrapped_table_pdf):
+    doc = pymupdf.open(str(wrapped_table_pdf))
+    regions = build_regions(doc[0], "d", 0)
+    by_text = {r.text.strip(): r for r in regions
+               if r.mode == EditMode.PRESERVE_LINE}
+    row = by_text[WRAPPED_CELL_R3]
+    assert row.grouping_reason, "table-lines should explain why they are line-level"
+    # a plain paragraph line elsewhere is not flagged
+    plain = by_text[WRAPPED_AFTER]
+    assert plain.grouping_reason == ""
+    doc.close()
+
+
+def test_other_column_text_blocks_merge():
+    """Synthetic minimal case: third line sitting in the gap blocks the merge."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    # two candidates at x=72, gap of 4pt
+    page.insert_text((72, 100), "Alpha text on the first row.", fontsize=11, fontname="helv")
+    page.insert_text((72, 115), "Beta text on the second row.", fontsize=11, fontname="helv")
+    # a third line in the gap, inside the candidates' x-range
+    page.insert_text((90, 108), "neighbour", fontsize=9, fontname="helv")
+    lines = extract_page_lines(page)
+    groups = group_paragraphs(lines)
+    merged = [g for g in groups if len(g) == 2]
+    assert not merged, "a line in the gap must block the merge"
+    doc.close()
+
+
+def test_long_paragraph_still_merges():
+    """Guard against over-correction: a real 6-line paragraph with an empty
+    right margin must still group (and survive the new blocker scan)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    y = 100
+    for i in range(6):
+        page.insert_text((72, y), f"Paragraph body line number {i + 1}.", fontsize=11,
+                         fontname="helv")
+        y += 15
+    lines = extract_page_lines(page)
+    groups = group_paragraphs(lines)
+    assert max(len(g) for g in groups) == 6, \
+        f"expected one 6-line paragraph, got {[len(g) for g in groups]}"
+    doc.close()
