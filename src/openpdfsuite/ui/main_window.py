@@ -111,6 +111,9 @@ class MainWindow(QMainWindow):
         self._converting_docx = False
         self._layout_box: tuple[int, tuple, str] | None = None
         self._insert_ctx: dict | None = None
+        self._redact_queue: list[tuple[int, list]] = []
+        self._redact_done: list[int] = []
+        self._pending_redact: dict | None = None
         self._last_save_dest: str | None = None
         self._recovery_key: str | None = None  # entry key; None -> session doc_id
         self.recovery = RecoveryStore()
@@ -185,8 +188,19 @@ class MainWindow(QMainWindow):
                                     "Select and edit existing text", checkable=True)
         self.action_tool_add = act("Add &Text", self._set_tool_add, QKeySequence("T"),
                                    "Add new text to a page", checkable=True)
+        self.action_tool_redact = act("&Black Out Text", self._set_tool_redact,
+                                      QKeySequence("R"),
+                                      "Mark text to remove permanently (black-out)",
+                                      checkable=True)
+        self.action_redact_apply = act("Appl&y Redaction", self._on_redact_apply,
+                                       QKeySequence("Ctrl+Shift+R"),
+                                       "Remove the marked text from the document "
+                                       "permanently")
+        self.action_redact_clear = act("Clear Black-Out &Marks", self._on_redact_clear,
+                                       None, "Remove all pending black-out marks")
         self.tool_group = QActionGroup(self)
-        for a in (self.action_tool_select, self.action_tool_edit, self.action_tool_add):
+        for a in (self.action_tool_select, self.action_tool_edit,
+                  self.action_tool_add, self.action_tool_redact):
             self.tool_group.addAction(a)
         self.action_tool_select.setChecked(True)
 
@@ -236,7 +250,9 @@ class MainWindow(QMainWindow):
                              + self._save_actions + self._export_actions)
         self._view_actions = [self.action_zoom_in, self.action_zoom_out,
                               self.action_fit_width, self.action_fit_page]
-        self._edit_tool_actions = [self.action_tool_edit, self.action_tool_add]
+        self._edit_tool_actions = [self.action_tool_edit, self.action_tool_add,
+                                   self.action_tool_redact]
+        self._redact_actions = [self.action_redact_apply, self.action_redact_clear]
         # availability is initialized in __init__ after docks exist
 
     def _has_doc(self) -> bool:
@@ -261,6 +277,23 @@ class MainWindow(QMainWindow):
             self.action_tool_add.setToolTip(hint_doc)
         else:
             self.action_tool_add.setToolTip("Click an empty spot to add new text (A)")
+        self.action_tool_redact.setEnabled(has_doc)
+        if not has_doc:
+            self.action_tool_redact.setToolTip(hint_doc)
+        else:
+            self.action_tool_redact.setToolTip(
+                "Drag boxes over text to remove it permanently (R)")
+        # redaction apply/clear: need a doc AND at least one pending mark
+        marks = self.view.has_redact_marks() if self.view is not None else False
+        for a in self._redact_actions:
+            a.setEnabled(has_doc and marks)
+        if has_doc and not marks:
+            for a in self._redact_actions:
+                a.setToolTip("No black-out marks yet — use the Black Out Text tool (R)")
+        elif has_doc:
+            self.action_redact_apply.setToolTip(
+                "Remove the marked text permanently (Ctrl+Shift+R)")
+            self.action_redact_clear.setToolTip("Remove all pending black-out marks")
         if has_doc:
             s = self.controller.session
             self.action_undo.setEnabled(s.can_undo)
@@ -314,6 +347,9 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.action_tool_select)
         m_edit.addAction(self.action_tool_edit)
         m_edit.addAction(self.action_tool_add)
+        m_edit.addAction(self.action_tool_redact)
+        m_edit.addAction(self.action_redact_apply)
+        m_edit.addAction(self.action_redact_clear)
         m_edit.addSeparator()
         m_edit.addAction(self.action_find)
 
@@ -386,6 +422,8 @@ class MainWindow(QMainWindow):
         tb.addAction(self.action_tool_select)
         tb.addAction(self.action_tool_edit)
         tb.addAction(self.action_tool_add)
+        tb.addAction(self.action_tool_redact)
+        tb.addAction(self.action_redact_apply)
         tb.addSeparator()
         tb.addAction(self.action_zoom_out)
         self.zoom_label = QLabel(" 100% ")
@@ -432,6 +470,12 @@ class MainWindow(QMainWindow):
 
         self.sidebar_tabs.search.search_requested.connect(self._on_search_requested)
         self.sidebar_tabs.search.result_activated.connect(self._on_search_result)
+        self.sidebar_tabs.search.blackout_all_requested.connect(
+            self._on_blackout_all_search)
+        r = self.sidebar_tabs.redact
+        r.mark_activated.connect(self._on_search_result)
+        r.mark_remove_requested.connect(self._on_redact_mark_removed)
+        r.clear_requested.connect(self._on_redact_clear)
 
         p = self.properties
         p.font_change_requested.connect(
@@ -557,6 +601,7 @@ class MainWindow(QMainWindow):
         self.view.region_double_clicked.connect(self._on_region_double_clicked)
         self.view.region_box_changed.connect(self._on_region_box_changed)
         self.view.add_text_requested.connect(self._on_add_text_requested)
+        self.view.redact_marks_changed.connect(self._on_redact_marks_changed)
         self.view.set_document(page_sizes, c.session.page_rotations)
 
         self.sidebar_tabs.thumbnails.set_page_count(meta.page_count)
@@ -830,6 +875,10 @@ class MainWindow(QMainWindow):
         self.controller.prepare_edit(page, region, edit)
 
     def _on_edit_prepared(self, info: dict) -> None:
+        if getattr(self, "_pending_redact", None) is not None:
+            # black-out flow bypasses overflow/replacement handling
+            self._on_redaction_prepared(info)
+            return
         pending = self._pending_edit
         if pending is None:
             return
@@ -920,6 +969,11 @@ class MainWindow(QMainWindow):
         return dlg.choice
 
     def _on_edit_committed(self, revision: int, page: int) -> None:
+        if getattr(self, "_pending_redact", None) is not None \
+                and self._pending_redact.get("page") == page:
+            self._on_redaction_committed(page, revision)
+            self._update_action_availability()
+            return
         was_insert = self._pending_edit is not None             and self._pending_edit.get("region") is None
         self._pending_edit = None
         self._recovery_timer.start()
@@ -1201,15 +1255,20 @@ class MainWindow(QMainWindow):
             self.controller.redo()
 
     # -- tools & view ------------------------------------------------------------
+    def _set_search_blackout(self, visible: bool) -> None:
+        self.sidebar_tabs.search.set_blackout_visible(visible)
+
     def _set_tool_select(self) -> None:
         if self.view:
             self.view.set_mode("select")
         self._clear_selection_state()
+        self._set_search_blackout(False)
         self.mode_label.setText("Select")
 
     def _set_tool_edit(self) -> None:
         if self.view:
             self.view.set_mode("edit")
+        self._set_search_blackout(False)
         self.mode_label.setText("Edit Text")
         self.statusBar().showMessage(
             "Edit Text: hover a line, click to select, double-click to edit.", 6000)
@@ -1217,9 +1276,162 @@ class MainWindow(QMainWindow):
     def _set_tool_add(self) -> None:
         if self.view:
             self.view.set_mode("add")
+        self._set_search_blackout(False)
         self.mode_label.setText("Add Text")
         self.statusBar().showMessage(
             "Add Text: click an empty area of the page where new text goes.", 6000)
+
+    def _set_tool_redact(self) -> None:
+        if self.view is not None:
+            self.view.set_mode("redact")
+        self._set_search_blackout(True)
+        self.sidebar_tabs.setCurrentWidget(self.sidebar_tabs.redact)
+        self.mode_label.setText("Black Out")
+        self.statusBar().showMessage(
+            "Black Out: drag a box over text to mark it, click a mark to remove it. "
+            "Apply Redaction removes marked text permanently.", 8000)
+
+    def _on_redact_clear(self) -> None:
+        if self.view is not None:
+            self.view.clear_redact_marks()
+            self.statusBar().showMessage("Black-out marks cleared.", 4000)
+
+    def _on_blackout_all_search(self, hits: list) -> None:
+        """Turn search hits into black-out marks (engine-space rects)."""
+        if self.view is None:
+            return
+        from ..domain.models import Rect as _Rect
+        for page, rect in hits:
+            self.view.add_redact_mark(page, _Rect(*rect))
+        self.sidebar_tabs.search.set_blackout_visible(True)
+        n = len(hits)
+        self.statusBar().showMessage(
+            f"{n} search hit{'s' if n != 1 else ''} added as black-out marks — "
+            "review them, then Apply Redaction.", 8000)
+
+    def _on_redact_mark_removed(self, page: int, rect) -> None:
+        if self.view is not None:
+            from ..domain.models import Rect as _Rect
+            self.view.remove_redact_mark(page, _Rect(*rect.as_tuple())
+                                         if hasattr(rect, "as_tuple") else _Rect(*rect))
+
+    def _on_redact_marks_changed(self) -> None:
+        self._refresh_redact_panel()
+        self._update_action_availability()
+
+    def _refresh_redact_panel(self) -> None:
+        """Mirror the view's marks into the sidebar list, with text snippets."""
+        redact_panel = self.sidebar_tabs.redact
+        if self.view is None:
+            redact_panel.show_marks([])
+            return
+        items: list[tuple[int, str, object]] = []
+        for page, rect in self.view.get_redact_marks():
+            snippet = self._snippet_under(page, rect)
+            items.append((page, snippet, rect))
+        redact_panel.show_marks(items)
+
+    def _snippet_under(self, page: int, rect) -> str:
+        """Text of the lines a mark covers, for the review list."""
+        lines = self.view.page_lines.get(page, []) if self.view else []
+        parts: list[str] = []
+        for text, bbox, _baseline in lines:
+            b = tuple(bbox)
+            if not (b[2] < rect.x0 or rect.x1 < b[0] or b[3] < rect.y0 or rect.y1 < b[3]):
+                parts.append(text.strip())
+        snippet = " ".join(parts)
+        if len(snippet) > 60:
+            snippet = snippet[:57] + "…"
+        return snippet or "(no text found here)"
+
+    def _on_redact_apply(self) -> None:
+        """Apply all pending black-out marks, one page at a time.
+
+        Sequential per-page prepare → preview → commit; cancel aborts the rest.
+        """
+        if self.view is None or self.controller is None:
+            return
+        marks = self.view.get_redact_marks()
+        if not marks:
+            return
+        pages = sorted({p for p, _r in marks})
+        self._redact_queue = [
+            (p, [r for pp, r in marks if pp == p]) for p in pages
+        ]
+        self._redact_done: list[int] = []
+        self.statusBar().showMessage("Preparing redaction…", 4000)
+        self._apply_next_redaction()
+
+    def _apply_next_redaction(self) -> None:
+        if self.controller is None:
+            self._redact_queue = []
+            return
+        if not self._redact_queue:
+            self.view.clear_redact_marks()
+            self._refresh_title()
+            done = len(self._redact_done)
+            self.statusBar().showMessage(
+                f"Redaction applied on {done} page{'s' if done != 1 else ''} — "
+                "the removed text is gone from the document. Save to keep it.",
+                9000)
+            return
+        page, boxes = self._redact_queue[0]
+        self._pending_redact = {"page": page, "boxes": boxes}
+        self.controller.prepare_redact(page, boxes)
+
+    def _on_redaction_prepared(self, info: dict) -> None:
+        pending = getattr(self, "_pending_redact", None)
+        if pending is None:
+            return
+        if not info["ok"]:
+            self._redact_queue = []
+            self._pending_redact = None
+            issues = info.get("issues") or ["The redaction could not be applied."]
+            QMessageBox.warning(self, "Black Out rejected", "\n".join(issues))
+            return
+        self._pending_redact["key"] = info["prepare_key"]
+        if self._confirm_redaction_preview(info):
+            self.controller.commit_edit(info["prepare_key"])
+        else:
+            self._redact_queue = []
+            self._pending_redact = None
+            self.statusBar().showMessage(
+                "Redaction canceled — nothing was changed.", 5000)
+
+    def _on_redaction_committed(self, page: int, revision: int) -> None:
+        pending = getattr(self, "_pending_redact", None)
+        if pending is None or pending.get("page") != page:
+            return
+        self._pending_redact = None
+        self._redact_done.append(page)
+        self._redact_queue = self._redact_queue[1:]
+        self.view.refresh_after_edit(page)
+        self._apply_next_redaction()
+
+    def _confirm_redaction_preview(self, info: dict) -> bool:
+        """Before/after preview for a black-out page. Seam for UI tests."""
+        before_png, after_png = info.get("before_png"), info.get("preview_png")
+        validation = info.get("validation")
+        pending = self._pending_redact or {}
+        if not before_png or not after_png:
+            return QMessageBox.question(
+                self, "Apply redaction",
+                "Preview images are unavailable, but the redaction passed "
+                "validation. Apply it?") == QMessageBox.StandardButton.Yes
+        boxes = list(pending.get("boxes") or [])  # already engine-space Rects
+        if boxes:
+            change = boxes[0]
+            for r in boxes[1:]:
+                change = Rect(min(change.x0, r.x0), min(change.y0, r.y0),
+                              max(change.x1, r.x1), max(change.y1, r.y1))
+            disp = self.view.rect_to_display(pending["page"], change)
+        else:
+            disp = Rect(0, 0, 1, 1)
+        dlg = PreviewDialog(self, self.theme, before_png, after_png, disp,
+                            2.0, validation, info.get("issues") or [],
+                            apply_label="Apply redaction",
+                            title="Preview black-out")
+        return dlg.exec() == QDialog.Accepted
 
     def _on_add_text_requested(self, page: int, x_pt: float, y_pt: float) -> None:
         if self.view is None or not (0 <= page < len(self.view.frames)):
@@ -1413,6 +1625,8 @@ class MainWindow(QMainWindow):
             "• Rotated, skewed, curved, or heavily transformed text may be read-only.\n"
             "• Exact original-font fidelity isn't promised; substitutions are always shown.\n"
             "• Pages with existing redaction annotations are read-only for safety.\n"
+            "• Black Out really removes marked text — but on scanned pages it only "
+            "covers the image; the scan still contains the content.\n"
             "• Editing invalidates digital signatures (unavoidable in any PDF editor).\n"
             "• No automatic reflow across pages; paragraphs reflow inside their box only."
         )

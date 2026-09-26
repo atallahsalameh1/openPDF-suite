@@ -125,11 +125,32 @@ class SearchPanel(QWidget):
         self.results.itemActivated.connect(self._on_result)
         layout.addWidget(self.results)
 
+        self.blackout_btn = QPushButton("Black out all…")
+        self.blackout_btn.setToolTip(
+            "Turn every search hit into a reviewable black-out mark")
+        self.blackout_btn.clicked.connect(self._on_blackout_all)
+        self.blackout_btn.hide()
+        layout.addWidget(self.blackout_btn)
+
         self.empty = QLabel("No results yet.\nType a query and press Enter.")
         self.empty.setProperty("role", "caption")
         self.empty.setAlignment(Qt.AlignCenter)
         self.empty.setWordWrap(True)
         layout.addWidget(self.empty)
+
+        self._last_items: list[tuple[int, str, object]] = []
+
+    def set_blackout_visible(self, visible: bool) -> None:
+        """'Black out all…' is only meaningful in Black Out mode (M9)."""
+        self.blackout_btn.setVisible(visible and bool(self._last_items))
+
+    def _on_blackout_all(self) -> None:
+        hits = [(page, rect) for page, _snippet, rect in self._last_items
+                if rect is not None]
+        if hits:
+            self.blackout_all_requested.emit(hits)
+
+    blackout_all_requested = Signal(list)  # [(page, rect), ...] engine space
 
     def set_search_enabled(self, enabled: bool) -> None:
         hint = "" if enabled else "Open a document to search it."
@@ -154,6 +175,7 @@ class SearchPanel(QWidget):
 
     def show_results(self, items: list[tuple[int, str, object]]) -> None:
         """items: (page_index, snippet, rect_payload)."""
+        self._last_items = list(items)
         self.results.clear()
         for page, snippet, rect in items:
             item = QListWidgetItem(f"p.{page + 1}  {snippet}")
@@ -164,12 +186,84 @@ class SearchPanel(QWidget):
         self.empty.setVisible(n == 0)
         self.empty.setText("No matches found." if n == 0 else self.empty.text())
         self.status.setText(f"{n} result" + ("" if n == 1 else "s"))
+        self.blackout_btn.setVisible(bool(items))
 
     def clear_results(self) -> None:
         self.results.clear()
+        self._last_items = []
+        self.blackout_btn.hide()
         self.status.setText("")
         self.empty.setText("No results yet.\nType a query and press Enter.")
         self.empty.show()
+
+
+class RedactPanel(QWidget):
+    """Pending black-out marks (M9): reviewable list before applying."""
+
+    mark_activated = Signal(int)  # page to scroll to
+    mark_remove_requested = Signal(int, object)  # page, Rect
+    clear_requested = Signal()
+
+    def __init__(self, theme: ThemeManager, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.theme = theme
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self.hint = QLabel(
+            "Black Out mode: drag a box over text to mark it, or use Search → "
+            "“Black out all…”. Apply Redaction removes the marked text "
+            "permanently — it cannot be undone after saving.")
+        self.hint.setProperty("role", "caption")
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+
+        self.marks = QListWidget()
+        self.marks.setObjectName("RedactMarks")
+        self.marks.itemActivated.connect(self._on_mark)
+        layout.addWidget(self.marks)
+
+        self.empty = QLabel("No black-out marks yet.")
+        self.empty.setProperty("role", "caption")
+        self.empty.setAlignment(Qt.AlignCenter)
+        self.empty.setWordWrap(True)
+        layout.addWidget(self.empty)
+
+        buttons = QHBoxLayout()
+        self.remove_btn = QPushButton("Remove selected")
+        self.remove_btn.clicked.connect(self._remove_selected)
+        buttons.addWidget(self.remove_btn)
+        self.clear_btn = QPushButton("Clear all")
+        self.clear_btn.clicked.connect(self.clear_requested)
+        buttons.addWidget(self.clear_btn)
+        layout.addLayout(buttons)
+
+    def _on_mark(self, item: QListWidgetItem) -> None:
+        data = item.data(Qt.UserRole)
+        if data:
+            self.mark_activated.emit(int(data[0]))
+
+    def _remove_selected(self) -> None:
+        item = self.marks.currentItem()
+        if item is None:
+            return
+        page, rect = item.data(Qt.UserRole)
+        self.mark_remove_requested.emit(int(page), rect)
+
+    def show_marks(self, items: list[tuple[int, str, object]]) -> None:
+        """items: (page_index, snippet, engine-space Rect)."""
+        self.marks.clear()
+        for page, snippet, rect in items:
+            label = f"p.{page + 1}  {snippet}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, (page, rect))
+            item.setToolTip(label)
+            self.marks.addItem(item)
+        n = len(items)
+        self.empty.setVisible(n == 0)
+        self.remove_btn.setEnabled(n > 0)
+        self.clear_btn.setEnabled(n > 0)
 
 
 class PropertiesPanel(QWidget):
@@ -310,12 +404,14 @@ class PropertiesPanel(QWidget):
 
 
 class SidebarTabs(QTabWidget):
-    """Left sidebar container: Pages + Search."""
+    """Left sidebar container: Pages + Search + Black Out."""
 
     def __init__(self, theme: ThemeManager, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("SidebarPanel")
         self.thumbnails = ThumbnailPanel(theme)
         self.search = SearchPanel(theme)
+        self.redact = RedactPanel(theme)
         self.addTab(self.thumbnails, "Pages")
         self.addTab(self.search, "Search")
+        self.addTab(self.redact, "Black Out")

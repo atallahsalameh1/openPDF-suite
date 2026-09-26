@@ -45,9 +45,11 @@ class PreviewDialog(QDialog):
 
     def __init__(self, parent: QWidget, theme: ThemeManager,
                  before_png: bytes, after_png: bytes, changed_box: Rect,
-                 preview_zoom: float, validation, issues: list[str]):
+                 preview_zoom: float, validation, issues: list[str],
+                 apply_label: str = "Apply edit",
+                 title: str = "Preview replacement"):
         super().__init__(parent)
-        self.setWindowTitle("Preview replacement")
+        self.setWindowTitle(title)
         self.setMinimumWidth(720)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -111,7 +113,7 @@ class PreviewDialog(QDialog):
         layout.addWidget(note)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("Apply edit")
+        buttons.button(QDialogButtonBox.Ok).setText(apply_label)
         buttons.button(QDialogButtonBox.Ok).setProperty("accent", True)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)

@@ -249,6 +249,62 @@ class TestEditUndoRedoSave:
         assert not res.ok
         assert "expired" in res.error
 
+    def test_redact_full_cycle_undo_save(self, worker, fixture_dir, tmp_path):
+        """M9: PREPARE_REDACT → COMMIT → undo → redo → validated save."""
+        import pymupdf as _pm
+
+        doc_id, _ = open_standard(worker, fixture_dir)
+        engine = worker.docs[doc_id].engine
+        r = engine.doc[0].search_for("End of first section.")[0]
+        boxes = [[r.x0, r.y0, r.x1, r.y1]]
+
+        prepared = worker.handle(req(P.PREPARE_REDACT,
+                                     {"page": 0, "boxes": boxes},
+                                     doc_id=doc_id, revision=0))
+        assert prepared.ok, prepared.error
+        assert prepared.payload["prepare_key"]
+        assert prepared.payload["validation"].ok
+
+        committed = worker.handle(req(P.COMMIT_EDIT,
+                                      {"prepare_key": prepared.payload["prepare_key"]},
+                                      doc_id=doc_id, revision=0))
+        assert committed.ok, committed.error
+        assert committed.payload["revision"] == 1
+        assert committed.payload["can_undo"]
+
+        text = worker.docs[doc_id].engine.doc[0].get_text()
+        assert "End of first section." not in text, "redacted text must be gone"
+
+        # undo restores the redacted text
+        undone = worker.handle(req(P.UNDO, doc_id=doc_id))
+        assert undone.ok and undone.payload["revision"] == 0
+        assert "End of first section." in worker.docs[doc_id].engine.doc[0].get_text()
+
+        # redo removes it again
+        redone = worker.handle(req(P.REDO, doc_id=doc_id))
+        assert redone.ok and redone.payload["revision"] == 1
+        assert "End of first section." not in worker.docs[doc_id].engine.doc[0].get_text()
+
+        # validated save: removed text must not reappear in the saved file
+        dest = tmp_path / "redacted.pdf"
+        saved = worker.handle(req(P.SAVE, {"path": str(dest)}, doc_id=doc_id,
+                                  revision=1))
+        assert saved.ok, saved.error
+        check = _pm.open(str(dest))
+        assert "End of first section." not in check[0].get_text()
+        check.close()
+
+    def test_redact_refuses_preexisting_annot_page(self, worker, fixture_dir):
+        doc_id, _ = open_standard(worker, fixture_dir)
+        # use the real existing_redaction fixture (un-applied annot present)
+        opened = worker.handle(req(P.OPEN, {"path": str(fixture_dir / "existing_redaction.pdf")}))
+        doc2 = opened.payload["meta"].doc_id
+        prepared = worker.handle(req(P.PREPARE_REDACT,
+                                     {"page": 0, "boxes": [[60, 90, 200, 112]]},
+                                     doc_id=doc2, revision=0))
+        assert not prepared.ok
+        assert "redaction" in (prepared.error or "").lower()
+
     def test_stale_region_prepare_rejected(self, worker, fixture_dir):
         doc_id, _ = open_standard(worker, fixture_dir)
         res = worker.handle(req(P.EXTRACT_REGIONS, {"page": 0}, doc_id=doc_id))

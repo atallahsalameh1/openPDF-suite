@@ -28,6 +28,7 @@ rotation 0).
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -87,6 +88,8 @@ class EditRecord:
     page_index: int
     pre_revision: int
     post_revision: int
+    redacted_text: str = ""  # text removed by a redaction commit (M9); feeds the
+    # save-time forbidden-text check so removed text can never silently persist
 
 
 @dataclass
@@ -556,6 +559,198 @@ class PdfEditEngine:
             ok=True, candidate_bytes=cand_bytes, validation=validation,
             preview_png=preview_png, record=record, pre_bytes=pre_bytes,
             before_png=before_png,
+        )
+
+    # -- redaction (M9: "Black Out Text" — true removal, no replacement) ---------
+    def prepare_redact(
+        self, page_index: int, boxes: list[Rect], preview_zoom: float = 2.0,
+    ) -> PreparedEdit:
+        """Remove all text under the given engine-space boxes; paint black.
+
+        Redaction is geometry-based (AGENTS.md §9): each marquee is snapped to
+        the union of the character boxes it touches (no half-covered glyphs),
+        removed on an isolated candidate, and validated before commit. Pages
+        with pre-existing redaction annotations are refused (D6): PyMuPDF's
+        `apply_redactions` applies every pending annot, so an unrelated annot
+        would be swept in. A scanned page (images, no text) is allowed with an
+        explicit disclosure: the box covers the image, the scan still has it.
+        """
+        def fail(validation: ValidationResult, issues: list[str]) -> PreparedEdit:
+            validation.ok = False
+            validation.issues.extend(issues)
+            reported = list(dict.fromkeys(validation.issues))
+            return PreparedEdit(ok=False, candidate_bytes=None, validation=validation,
+                                preview_png=None, record=None, issues=reported)
+
+        validation = ValidationResult(ok=True)
+        if not boxes:
+            return fail(validation, ["No black-out areas were marked."])
+        page = self.doc[page_index]
+        for annot in page.annots() or []:
+            if annot.type[0] == pymupdf.PDF_ANNOT_REDACT:
+                return fail(validation, [
+                    "This page has an existing redaction annotation. Black-out is "
+                    "disabled here to avoid applying unrelated redactions."])
+
+        candidate = None
+        try:
+            pre_bytes = self.doc.tobytes()
+            candidate = pymupdf.open(stream=pre_bytes)
+            cand_page = candidate[page_index]
+
+            # char-aware snapping with MuPDF's own removal rule: a character is
+            # removed iff its box MIDPOINT lies inside the redaction rect
+            # (verified empirically — a char whose box merely overlaps survives,
+            # even at ~49% coverage). Snapping therefore uses the same midpoint
+            # predicate, computed from the ORIGINAL page (pre-mutation geometry)
+            # so the validation below compares identical geometry on both sides.
+            def _mid(cb: Rect) -> tuple[float, float]:
+                return ((cb.x0 + cb.x1) / 2.0, (cb.y0 + cb.y1) / 2.0)
+
+            orig_lines_chars = extract_page_lines(page, with_chars=True)
+            all_chars = [(ch, cb) for ln in orig_lines_chars for run in ln.runs
+                         if run.char_bboxes and len(run.char_bboxes) == len(run.text)
+                         for ch, cb in zip(run.text, run.char_bboxes, strict=True)]
+            snapped: list[Rect] = []
+            removed_texts: list[str] = []
+            scanned_cover = False
+            has_images = bool(page.get_images())
+            for box in boxes:
+                hit_chars: list[Rect] = []
+                texts: list[str] = []
+                for ch, cb in all_chars:
+                    mx, my = _mid(cb)
+                    if not (box.x0 <= mx <= box.x1 and box.y0 <= my <= box.y1):
+                        continue
+                    texts.append(ch)  # spaces keep word boundaries
+                    hit_chars.append(cb)
+                if not any(not ch.isspace() for ch in texts):
+                    if not has_images:
+                        return fail(validation, [
+                            "One of the marked areas has no text under it — nothing "
+                            "to remove there."])
+                    # scanned page: nothing removable under the box, but the
+                    # user wants it covered — paint-only, with disclosure below
+                    snapped.append(box)
+                    scanned_cover = True
+                    continue
+                x0 = min(cb.x0 for cb in hit_chars)
+                y0 = min(cb.y0 for cb in hit_chars)
+                x1 = max(cb.x1 for cb in hit_chars)
+                y1 = max(cb.y1 for cb in hit_chars)
+                snapped.append(Rect(x0, y0, x1, y1))
+                removed_texts.append(_norm_ws("".join(texts)))
+
+            for rect in snapped:
+                cand_page.add_redact_annot(_to_mupdf_rect(rect), fill=(0, 0, 0))
+            cand_page.apply_redactions(
+                images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+            )
+
+            # Validation is CHAR-level (D18 fix): line bboxes are too coarse —
+            # the marked line's own leftovers (e.g. 'End ' + 'ction.' after
+            # marking its middle) are legitimate, and neighbouring line boxes
+            # can graze the mark's edge in tight leading. Characters are exact:
+            #   * every char inside a snapped mark must be gone;
+            #   * the multiset of chars outside the marks must be identical
+            #     before vs after (same char, same position ±0.1 pt).
+            def _chars(lines) -> list[tuple[str, Rect]]:
+                out: list[tuple[str, Rect]] = []
+                for ln in lines:
+                    for run in ln.runs:
+                        if run.char_bboxes and len(run.char_bboxes) == len(run.text):
+                            out.extend(zip(run.text, run.char_bboxes, strict=True))
+                return out
+
+            def _inside(cb: Rect) -> bool:
+                mx, my = _mid(cb)
+                return any(r.x0 <= mx <= r.x1 and r.y0 <= my <= r.y1 for r in snapped)
+
+            before_chars = _chars(orig_lines_chars)
+            after_chars = _chars(extract_page_lines(cand_page, with_chars=True))
+
+            survivors = [(ch, cb) for ch, cb in after_chars if _inside(cb)]
+            if survivors:
+                sample = "".join(ch for ch, _ in survivors[:12])
+                validation.ok = False
+                validation.issues.append(
+                    f"Verification failed: {len(survivors)} characters inside a "
+                    f"black-out area survived removal ({sample!r}…).")
+            before_outside = Counter(
+                (ch, round(cb.x0, 1), round(cb.y0, 1), round(cb.x1, 1), round(cb.y1, 1))
+                for ch, cb in before_chars if not _inside(cb))
+            after_outside = Counter(
+                (ch, round(cb.x0, 1), round(cb.y0, 1), round(cb.x1, 1), round(cb.y1, 1))
+                for ch, cb in after_chars if not _inside(cb))
+            lost = before_outside - after_outside
+            extra = after_outside - before_outside
+            if lost or extra:
+                validation.collateral_change = True
+            if validation.collateral_change:
+                detail = ""
+                if lost:
+                    ex = "".join(ch for (ch, *_), n in list(lost.items())[:8]
+                                 for _ in range(n))
+                    detail += f" deleted {sum(lost.values())} chars ({ex!r}…)"
+                if extra:
+                    detail += f" gained {sum(extra.values())} unexpected chars"
+                validation.ok = False
+                validation.issues.append(
+                    "Edit rejected: text outside the black-out areas would "
+                    "change." + detail)
+            if not validation.ok:
+                candidate.close()
+                return fail(validation, [])
+
+            # pixels: only the marked display-space area may change
+            change_box = snapped[0]
+            for r in snapped[1:]:
+                change_box = _union(change_box, r)
+            padded = change_box.inflated(_PAD, _PAD)
+            before = self.doc[page_index].get_pixmap(
+                matrix=pymupdf.Matrix(preview_zoom, preview_zoom))
+            after = candidate[page_index].get_pixmap(
+                matrix=pymupdf.Matrix(preview_zoom, preview_zoom))
+            self._validate_pixels(before, after, self._display_rect(page_index, padded),
+                                  preview_zoom, validation)
+            if not validation.ok:
+                candidate.close()
+                return fail(validation, [])
+
+            if scanned_cover:
+                validation.issues.append(
+                    "Marked area looks scanned (image, no removable text) — the "
+                    "black box covers it; the scan itself still contains the "
+                    "content.")
+
+            preview_png = after.tobytes("png")
+            cand_bytes = candidate.tobytes(deflate=True)
+            candidate.close()
+        except Exception as exc:  # engine failure must never corrupt the working doc
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except Exception:
+                    pass
+            return fail(ValidationResult(ok=False), [f"Redaction failed: {exc}"])
+
+        record = EditRecord(
+            region=None,
+            edit=ReplacementEdit(
+                region_id=f"redact:p{page_index}:r{self.revision}",
+                source_revision=self.revision, new_text="",
+                mode=EditMode.REFLOW_BOX, page_index=page_index,
+            ),
+            resolved_family="", resolved_source="",
+            page_index=page_index,
+            pre_revision=self.revision, post_revision=self.revision + 1,
+            redacted_text=" ".join(removed_texts),
+        )
+        return PreparedEdit(
+            ok=True, candidate_bytes=cand_bytes, validation=validation,
+            preview_png=preview_png, record=record, pre_bytes=pre_bytes,
+            before_png=before.tobytes("png"),
         )
 
     # -- commit ------------------------------------------------------------------

@@ -15,7 +15,13 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QPixmap
 
-from ..domain.models import DocxExportOptions, DocxExportResult, ReplacementEdit, TextRegion
+from ..domain.models import (
+    DocxExportOptions,
+    DocxExportResult,
+    Rect,
+    ReplacementEdit,
+    TextRegion,
+)
 from ..infrastructure.logging import get_logger
 from ..infrastructure.pdf import protocol as P
 from .render_cache import CacheKey, RenderCache
@@ -145,6 +151,15 @@ class DocumentController(QObject):
                           "edit": edit, "preview_zoom": preview_zoom},
                          doc_id=self.session.doc_id, revision=self.session.revision)
 
+    def prepare_redact(self, page: int, boxes: list[Rect],
+                       preview_zoom: float = 2.0) -> None:
+        """Black-out marks (M9): remove all text under the engine-space boxes."""
+        assert self.session
+        self.client.send(P.PREPARE_REDACT,
+                         {"page": page, "boxes": [b.as_tuple() for b in boxes],
+                          "preview_zoom": preview_zoom},
+                         doc_id=self.session.doc_id, revision=self.session.revision)
+
     def commit_edit(self, prepare_key: str) -> None:
         assert self.session
         self.client.send(P.COMMIT_EDIT, {"prepare_key": prepare_key},
@@ -208,6 +223,8 @@ class DocumentController(QObject):
         elif res.kind == P.SEARCH:
             self._on_search(res)
         elif res.kind == P.PREPARE_EDIT:
+            self._on_prepared(res)
+        elif res.kind == P.PREPARE_REDACT:
             self._on_prepared(res)
         elif res.kind == P.COMMIT_EDIT:
             self._on_committed(res)

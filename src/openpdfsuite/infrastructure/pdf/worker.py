@@ -349,6 +349,29 @@ class PdfWorker:
                                "prepare_key": key if prepared.ok else None,
                                "issues": prepared.issues})
 
+    def _on_prepare_redact(self, req: Request) -> Result:
+        """Black-out marks (M9): true removal of text under engine-space boxes."""
+        state = self._doc(req)
+        preview_zoom = float(req.payload.get("preview_zoom", 2.0))
+        page_index = int(req.payload["page"])
+        boxes = [Rect(*b) for b in req.payload["boxes"]]
+        prepared = state.engine.prepare_redact(page_index, boxes,
+                                               preview_zoom=preview_zoom)
+        key = uuid.uuid4().hex
+        if prepared.ok:
+            state.prepared[key] = prepared
+            if len(state.prepared) > 8:
+                for old in list(state.prepared)[:len(state.prepared) - 8]:
+                    state.prepared.pop(old, None)
+        return Result(request_id=req.request_id, kind=req.kind, doc_id=req.doc_id,
+                      revision=state.engine.revision, ok=prepared.ok,
+                      error=None if prepared.ok else (prepared.issues[0] if prepared.issues else "redaction failed"),
+                      payload={"validation": prepared.validation,
+                               "preview_png": prepared.preview_png,
+                               "before_png": prepared.before_png,
+                               "prepare_key": key if prepared.ok else None,
+                               "issues": prepared.issues})
+
     def _on_commit_edit(self, req: Request) -> Result:
         state = self._doc(req)
         key = req.payload["prepare_key"]
@@ -364,7 +387,8 @@ class PdfWorker:
             state.undo.pop(0)
         state.redo.clear()
         want = " ".join(record.edit.new_text.split())
-        gone = " ".join(record.region.text.split()) if record.region is not None else ""
+        gone = (" ".join(record.region.text.split()) if record.region is not None
+                else " ".join(record.redacted_text.split()))
         exp, forb = state.changed_pages.get(page_index, ("", ""))
         state.changed_pages[page_index] = (
             want if want else exp,

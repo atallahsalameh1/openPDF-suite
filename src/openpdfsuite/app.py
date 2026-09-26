@@ -45,7 +45,27 @@ def create_app(argv: list[str] | None = None) -> QApplication:
     app.setOrganizationName("OpenPDFSuite")
     app.setWindowIcon(app_icon())  # brand mark in title bar / taskbar
     app.setFont(_pick_font())
+    _install_excepthook()
     return app
+
+
+def _install_excepthook() -> None:
+    """Log uncaught exceptions (including Qt slot errors) to the app log.
+
+    Without this, an exception raised in a Qt slot only reaches the console —
+    invisible for a windowed launch — and the UI silently does nothing.
+    """
+    import traceback
+
+    from .infrastructure.logging import get_logger
+
+    log = get_logger("ui.errors")
+
+    def _hook(exc_type, exc, tb) -> None:
+        log.error("uncaught exception:\n%s", "".join(traceback.format_exception(
+            exc_type, exc, tb)))
+
+    sys.excepthook = _hook
 
 
 def open_window(path: str | None = None) -> MainWindow:

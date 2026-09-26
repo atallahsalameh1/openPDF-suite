@@ -162,6 +162,37 @@ class PageFrame(QWidget):
                 painter.drawRoundedRect(QRectF(px - 4, py - 4, 8, 8), 2, 2)
                 painter.fillRect(QRectF(px - 3, py - 3, 6, 6), handle_brush)
 
+        # black-out marks (M9): red tint + border, distinct from search yellow
+        # and the accent blue; also the dashed in-progress marquee
+        red = QColor("#DC2626")
+        for rect in self.view.redact_marks.get(self.index, ()):
+            er = self.view.rect_to_display(self.index, rect)
+            r = QRectF(pr.x() + er.x0 * self.zoom, pr.y() + er.y0 * self.zoom,
+                       er.width * self.zoom, er.height * self.zoom)
+            tint = QColor(red)
+            tint.setAlpha(46)
+            painter.fillRect(r, tint)
+            pen = painter.pen()
+            pen.setColor(red)
+            pen.setWidthF(1.5)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(r)
+        if self.view.mode == "redact" and self.view._redact_drag_rect is not None \
+                and self.view._redact_drag is not None \
+                and self.view._redact_drag[0] == self.index:
+            d = self.view._redact_drag_rect
+            r = QRectF(pr.x() + d[0] * self.zoom, pr.y() + d[1] * self.zoom,
+                       (d[2] - d[0]) * self.zoom, (d[3] - d[1]) * self.zoom)
+            pen = painter.pen()
+            pen.setColor(red)
+            pen.setStyle(Qt.DashLine)
+            pen.setWidthF(1.5)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(r)
+            pen.setStyle(Qt.SolidLine)
+
     # -- mouse -----------------------------------------------------------
     def mousePressEvent(self, event):
         self.view._frame_mouse_press(self, event)
@@ -208,7 +239,7 @@ class DocumentView(QScrollArea):
         self.viewport().setObjectName("CanvasViewport")
         self.viewport().setAttribute(Qt.WA_StyledBackground, True)
         self.frames: list[PageFrame] = []
-        self.mode = "select"  # select | edit | add
+        self.mode = "select"  # select | edit | add | redact
         self.page_rotations: list[int] = []  # per-page /Rotate from the worker
         self.search_highlights: dict[int, list[tuple]] = {}
         self.selection_rects: dict[int, list[tuple]] = {}
@@ -222,6 +253,10 @@ class DocumentView(QScrollArea):
         self._pending: set[tuple[int, float]] = set()
         self._pending_regions: set[int] = set()
         self._drag_start: tuple[int, QPoint] | None = None
+        # M9 redaction marks: engine-space rects per page; the black-out tool
+        self.redact_marks: dict[int, list[Rect]] = {}
+        self._redact_drag: tuple[int, QPoint] | None = None
+        self._redact_drag_rect: tuple | None = None  # display-space, for painting
         self._request_timer = QTimer(self)
         self._request_timer.setSingleShot(True)
         self._request_timer.setInterval(60)  # debounce zoom/scroll bursts
@@ -258,6 +293,9 @@ class DocumentView(QScrollArea):
         self.page_regions.clear()
         self.search_highlights.clear()
         self.selection_rects.clear()
+        self.redact_marks.clear()
+        self._redact_drag = None
+        self._redact_drag_rect = None
         self._pending.clear()
         self.current_page_changed.emit(0)
 
@@ -406,10 +444,11 @@ class DocumentView(QScrollArea):
     view_request_regions = Signal(int)  # page (edit mode)
     region_box_changed = Signal(int, tuple)  # page, box (layout box moved/resized)
     add_text_requested = Signal(int, float, float)  # page, x_pt, y_pt
+    redact_marks_changed = Signal()  # M9: any mark added/removed/cleared
 
     # -- mode ---------------------------------------------------------------
     def set_mode(self, mode: str) -> None:
-        """'select' | 'edit' | 'add'."""
+        """'select' | 'edit' | 'add' | 'redact'."""
         if mode == self.mode:
             return
         self.mode = mode
@@ -417,10 +456,17 @@ class DocumentView(QScrollArea):
         self.selected_region_rect = None
         self._pending_regions.clear()
         self._box_drag = None
-        if mode == "add":
+        self._redact_drag = None
+        self._redact_drag_rect = None
+        if mode in ("add", "redact"):
             self.layout_box_rect = None
         for frame in self.frames:
-            frame.setCursor(Qt.IBeamCursor if mode == "select" else Qt.ArrowCursor)
+            if mode == "select":
+                frame.setCursor(Qt.IBeamCursor)
+            elif mode == "redact":
+                frame.setCursor(Qt.CrossCursor)
+            else:
+                frame.setCursor(Qt.ArrowCursor)
             frame.update()
         if mode == "edit":
             self._schedule_requests()
@@ -434,6 +480,42 @@ class DocumentView(QScrollArea):
         self.layout_box_rect = (page, box) if page is not None and box else None
         for frame in self.frames:
             frame.update()
+
+    # -- redaction marks (M9) --------------------------------------------------
+    def get_redact_marks(self) -> list[tuple[int, Rect]]:
+        """All pending black-out marks as (page, engine-space Rect)."""
+        return [(page, r) for page, rects in self.redact_marks.items() for r in rects]
+
+    def add_redact_mark(self, page: int, rect: Rect) -> None:
+        self.redact_marks.setdefault(page, []).append(rect)
+        self._repaint_page(page)
+        self.redact_marks_changed.emit()
+
+    def remove_redact_mark(self, page: int, rect: Rect) -> None:
+        marks = self.redact_marks.get(page, [])
+        if rect in marks:
+            marks.remove(rect)
+            if not marks:
+                self.redact_marks.pop(page, None)
+            self._repaint_page(page)
+            self.redact_marks_changed.emit()
+
+    def clear_redact_marks(self) -> None:
+        pages = list(self.redact_marks)
+        self.redact_marks.clear()
+        self._redact_drag = None
+        self._redact_drag_rect = None
+        for page in pages:
+            self._repaint_page(page)
+        if pages:
+            self.redact_marks_changed.emit()
+
+    def has_redact_marks(self) -> bool:
+        return any(self.redact_marks.values())
+
+    def _repaint_page(self, page: int) -> None:
+        if 0 <= page < len(self.frames):
+            self.frames[page].update()
 
     # -- layout-box geometry ------------------------------------------------------
     _HANDLES = ("tl", "tr", "bl", "br", "t", "b", "l", "r")
@@ -564,6 +646,22 @@ class DocumentView(QScrollArea):
             if page_pos is not None:
                 pt = self.point_to_engine(frame.index, page_pos.x(), page_pos.y())
                 self.add_text_requested.emit(frame.index, float(pt.x), float(pt.y))
+        elif self.mode == "redact":
+            page_pos = frame.map_to_page(event.position().toPoint())
+            if page_pos is None:
+                return
+            pt = self.point_to_engine(frame.index, page_pos.x(), page_pos.y())
+            # click inside an existing mark removes it; otherwise start a marquee
+            for rect in self.redact_marks.get(frame.index, []):
+                if rect.x0 - 2 <= pt.x <= rect.x1 + 2 and rect.y0 - 2 <= pt.y <= rect.y1 + 2:
+                    self.remove_redact_mark(frame.index, rect)
+                    self.status_message.emit(
+                        "Mark removed. All marks stay until you apply them.")
+                    return
+            self._redact_drag = (frame.index, page_pos)
+            self._redact_drag_rect = (page_pos.x(), page_pos.y(),
+                                      page_pos.x(), page_pos.y())
+            frame.update()
 
     def _frame_mouse_move(self, frame: PageFrame, event) -> None:
         if self.mode == "select" and self._drag_start is not None:
@@ -588,6 +686,13 @@ class DocumentView(QScrollArea):
             )
             frame.update()
             self.region_hovered.emit(frame.index, region)
+        elif self.mode == "redact" and self._redact_drag is not None:
+            page_pos = frame.map_to_page(event.position().toPoint())
+            if page_pos is not None and frame.index == self._redact_drag[0]:
+                sx, sy = self._redact_drag[1].x(), self._redact_drag[1].y()
+                self._redact_drag_rect = (min(sx, page_pos.x()), min(sy, page_pos.y()),
+                                          max(sx, page_pos.x()), max(sy, page_pos.y()))
+                frame.update()
 
     def _update_box_drag(self, frame: PageFrame, pos: QPoint) -> None:
         px = frame.map_to_page(pos)
@@ -633,6 +738,34 @@ class DocumentView(QScrollArea):
             if self.selected_text:
                 self.status_message.emit(
                     f"{len(self.selected_text.split())} words selected — Ctrl+C to copy")
+            return
+        if self.mode == "redact" and self._redact_drag is not None:
+            drag_page, start = self._redact_drag
+            self._redact_drag = None
+            rect_disp = self._redact_drag_rect
+            self._redact_drag_rect = None
+            frame.update()
+            if frame.index != drag_page or rect_disp is None:
+                return
+            w, h = rect_disp[2] - rect_disp[0], rect_disp[3] - rect_disp[1]
+            if w < 3 or h < 3:  # click without drag on empty spot: no-op
+                return
+            disp = Rect(*rect_disp)
+            mark = self.rect_to_engine(frame.index, disp)
+            page_rect = self._engine_page_rect(frame)
+            mark = Rect(max(mark.x0, page_rect.x0), max(mark.y0, page_rect.y0),
+                        min(mark.x1, page_rect.x1), min(mark.y1, page_rect.y1))
+            if mark.width < 1 or mark.height < 1:
+                return
+            self.add_redact_mark(frame.index, mark)
+            n = len(self.get_redact_marks())
+            self.status_message.emit(
+                f"{n} area{'s' if n != 1 else ''} marked — Apply Redaction to "
+                "remove the text permanently.")
+
+    def _engine_page_rect(self, frame: PageFrame) -> Rect:
+        tf = self._page_tf(frame.index)
+        return Rect(0.0, 0.0, tf.crop_w, tf.crop_h)
 
     def _frame_mouse_double(self, frame: PageFrame, event) -> None:
         if self.mode == "edit":
@@ -703,6 +836,12 @@ class DocumentView(QScrollArea):
     def keyPressEvent(self, event) -> None:
         if event.matches(QKeySequence.StandardKey.Copy):
             self.copy_selection()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape and self.mode == "redact" \
+                and self.has_redact_marks():
+            self.clear_redact_marks()
+            self.status_message.emit("Black-out marks cleared.")
             event.accept()
             return
         super().keyPressEvent(event)

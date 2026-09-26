@@ -22,6 +22,7 @@ EXTRACT_REGIONS = "extract_regions"
 EXTRACT_PAGE_TEXT = "extract_page_text"
 SEARCH = "search"
 PREPARE_EDIT = "prepare_edit"
+PREPARE_REDACT = "prepare_redact"  # black-out marks: true text removal (M9)
 COMMIT_EDIT = "commit_edit"
 UNDO = "undo"
 REDO = "redo"
