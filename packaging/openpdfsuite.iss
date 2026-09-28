@@ -1,10 +1,10 @@
 ; openPDF suite — Inno Setup installer script (M7).
 ; Build (after PyInstaller produces build\dist\OpenPDFSuite):
 ;   "C:\Users\<user>\AppData\Local\Programs\Inno Setup 6\ISCC.exe" packaging\openpdfsuite.iss
-; Output: build\installer\OpenPDFSuiteSetup-0.1.0.exe
+; Output: build\installer\OpenPDFSuiteSetup-0.2.0.exe
 
 #define SuiteName "openPDF suite"
-#define SuiteVersion "0.1.0"
+#define SuiteVersion "0.2.0"
 #define SuitePublisher "openPDFsuite"
 #define SuiteExeName "OpenPDFSuite.exe"
 

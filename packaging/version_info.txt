@@ -3,8 +3,8 @@
 # https://pyinstaller.org/en/stable/usage.html#capturing-version-data
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(0, 1, 0, 0),
-    prodvers=(0, 1, 0, 0),
+    filevers=(0, 2, 0, 0),
+    prodvers=(0, 2, 0, 0),
     mask=0x3F,
     flags=0x0,
     OS=0x40004,
@@ -20,12 +20,12 @@ VSVersionInfo(
           [
             StringStruct("CompanyName", "openPDFsuite"),
             StringStruct("FileDescription", "openPDF suite — PDF Text Editor"),
-            StringStruct("FileVersion", "0.1.0"),
+            StringStruct("FileVersion", "0.2.0"),
             StringStruct("InternalName", "OpenPDFSuite"),
             StringStruct("LegalCopyright", "© 2026 openPDFsuite. Third-party licenses: see THIRD_PARTY_NOTICES.md."),
             StringStruct("OriginalFilename", "OpenPDFSuite.exe"),
             StringStruct("ProductName", "openPDF suite"),
-            StringStruct("ProductVersion", "0.1.0"),
+            StringStruct("ProductVersion", "0.2.0"),
           ],
         ),
       ],
