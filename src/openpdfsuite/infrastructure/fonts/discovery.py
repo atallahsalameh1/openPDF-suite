@@ -31,6 +31,27 @@ class FamilyFiles:
 
 
 _cache: dict[str, FamilyFiles] | None = None
+_cmap_cache: dict[str, frozenset[int]] = {}  # font file -> Unicode codepoints (D20)
+
+
+def _cmap_of_file(path: str) -> frozenset[int]:
+    """Unicode codepoints of a font file, parsed once per process (D20).
+
+    Replace-All coverage checks run per match; without this cache fontTools
+    would re-parse the same font hundreds of times per plan.
+    """
+    cps = _cmap_cache.get(path)
+    if cps is None:
+        from fontTools.ttLib import TTFont
+
+        try:
+            tt = TTFont(path, fontNumber=0, lazy=True)
+            cps = frozenset(tt.getBestCmap().keys())
+            tt.close()
+        except Exception:
+            cps = frozenset()  # unparseable font: treat as covering nothing
+        _cmap_cache[path] = cps
+    return cps
 
 
 def _font_dirs() -> list[Path]:
@@ -127,15 +148,8 @@ def find_family(family: str) -> FamilyFiles | None:
 
 def coverage_of_file(path: str, chars: set[str]) -> set[str]:
     """Return the subset of `chars` NOT covered by the font file's cmap."""
-    from fontTools.ttLib import TTFont
-
-    try:
-        tt = TTFont(path, fontNumber=0, lazy=True)
-        cmap = tt.getBestCmap()
-        tt.close()
-    except Exception:
-        return set(chars)
-    return {c for c in chars if ord(c) not in cmap and not c.isspace()}
+    covered = _cmap_of_file(path)
+    return {c for c in chars if ord(c) not in covered and not c.isspace()}
 
 
 def coverage_of_buffer(buf: bytes, chars: set[str]) -> set[str]:

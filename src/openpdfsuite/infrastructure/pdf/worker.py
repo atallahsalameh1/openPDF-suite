@@ -12,6 +12,7 @@ capped; recovery replay (M5) uses the stored EditRecords.
 
 from __future__ import annotations
 
+import itertools
 import multiprocessing
 import os
 import traceback
@@ -20,9 +21,24 @@ from dataclasses import dataclass, field
 
 import pymupdf
 
-from ...domain.models import DocumentMeta, DocxExportOptions, Rect, ReplacementEdit, TextRegion
+from ...domain.models import (
+    DocumentMeta,
+    DocxExportOptions,
+    EditMode,
+    Rect,
+    ReplacementEdit,
+    TextRegion,
+)
 from ..docx.docx_writer import DocxExportError, write_docx_atomic
-from .editor import EditRecord, PdfEditEngine, PreparedEdit
+from .editor import (
+    BatchPair,
+    EditRecord,
+    PairOutcome,
+    PdfEditEngine,
+    PreparedEdit,
+    apply_ranges,
+    find_line_matches,
+)
 from .extractor import build_regions, extract_page_lines, page_geometry
 from .protocol import (
     SHUTDOWN,
@@ -30,13 +46,87 @@ from .protocol import (
     Result,
 )
 from .saver import SaveChecks, SaveError, fingerprint_file, has_signature, save_validated
+from .textnorm import norm_cmp
 
 UNDO_CAP = 32
 MAX_SEARCH_RESULTS = 500
+MAX_PREVIEW_PAGES = 40  # before/after images shipped to the review window (M10)
+MAX_BATCH_PLANS = 3  # remembered Replace-All plans per document
 
 
 def file_fingerprint(path: str) -> str:
     return fingerprint_file(path)
+
+
+def _norm_ws(s: str) -> str:
+    return " ".join(s.split())
+
+
+@dataclass
+class _BatchPlan:
+    """A planned Replace-All run (M10), kept worker-side until applied.
+
+    Matches carry their ids from the plan scan; apply re-runs the identical
+    deterministic scan (the revision guard guarantees the same text) and keeps
+    only the included ids, so the review window's checkboxes drive apply
+    without shipping regions across the pipe twice.
+    """
+
+    key: str
+    revision: int
+    query: str
+    replacement: str
+    match_case: bool
+    whole_word: bool
+    auto_shrink: bool
+    matches: dict[int, dict] = field(default_factory=dict)
+    prepared: dict[int, PreparedEdit] = field(default_factory=dict)  # page -> plan candidate
+    page_rects: dict[int, tuple] = field(default_factory=dict)  # page -> display-space change rect
+    preview_zoom: float = 2.0
+
+
+def _match_page_regions(
+    engine: PdfEditEngine, doc_id: str, page_index: int, query: str,
+    match_case: bool, whole_word: bool, counter, include: set[int] | None = None,
+) -> tuple[list[tuple[TextRegion, list[tuple[int, int]], list[int]]], bool]:
+    """Deterministic match scan for one page (M10).
+
+    Assigns match ids in a fixed order — pages ascending, lines in extraction
+    order, occurrences left to right — so plan and apply produce identical ids
+    for an unchanged document. `include` filters which ids become pairs; ids
+    are consumed for every occurrence either way (and stop at
+    MAX_SEARCH_RESULTS in both plan and apply). Returns (entries, truncated)
+    with entries = (region, char ranges, match ids) per matched line region;
+    non-editable regions are included so the caller can report them skipped.
+    """
+    regions = build_regions(engine.doc[page_index], doc_id, engine.revision,
+                            include_paragraphs=False)
+    for region in regions:
+        cap = engine.capability(page_index, region)
+        region.editable = cap.editable
+        region.unsupported_reason = "" if cap.editable else cap.reason
+    grouped: dict[int, tuple[TextRegion, list[tuple[int, int]], list[int]]] = {}
+    truncated = False
+    for region in regions:
+        line = region.lines[0]
+        for start, end in find_line_matches(line.text, query, match_case, whole_word):
+            mid = next(counter)
+            if mid >= MAX_SEARCH_RESULTS:
+                truncated = True
+                return list(grouped.values()), True
+            if include is not None and mid not in include:
+                continue
+            entry = grouped.setdefault(id(region), (region, [], []))
+            entry[1].append((start, end))
+            entry[2].append(mid)
+    return list(grouped.values()), truncated
+
+
+def _record_pages(record: EditRecord) -> list[int]:
+    """Pages a committed record touched (grouped batches report all of them)."""
+    if record.pairs:
+        return sorted({edit.page_index for _, edit in record.pairs})
+    return [record.page_index]
 
 
 @dataclass
@@ -48,8 +138,10 @@ class _DocState:
     undo: list[tuple[bytes, EditRecord]] = field(default_factory=list)
     redo: list[tuple[bytes, EditRecord]] = field(default_factory=list)
     prepared: dict[str, PreparedEdit] = field(default_factory=dict)
-    changed_pages: dict[int, tuple[str, str]] = field(default_factory=dict)
-    # page -> (expected_text, forbidden_text) accumulated across edits
+    changed_pages: dict[int, tuple[list[str], list[str]]] = field(default_factory=dict)
+    # page -> ([expected texts], [forbidden texts]) accumulated across edits;
+    # lists since a Replace-All batch rebuilds several lines of one page (M10)
+    batch: dict[str, _BatchPlan] = field(default_factory=dict)
 
 
 class PdfWorker:
@@ -276,22 +368,23 @@ class PdfWorker:
         if not query:
             return Result(request_id=req.request_id, kind=req.kind, doc_id=req.doc_id,
                           revision=state.engine.revision, payload={"results": []})
-        needle = query if match_case else query.lower()
         results: list[dict] = []
         doc = state.engine.doc
         for page_index in range(doc.page_count):
             page = doc[page_index]
             for line in extract_page_lines(page):
-                hay = line.text if match_case else line.text.lower()
-                start = 0
-                while (pos := hay.find(needle, start)) != -1 and len(results) < MAX_SEARCH_RESULTS:
-                    rect = self._match_rect(line, pos, len(needle))
+                # find_line_matches normalizes in NFKC space (D20), so a
+                # logical-Arabic needle finds presentation-form extracted text
+                for start, end in find_line_matches(line.text, query,
+                                                    match_case=match_case):
+                    rect = self._match_rect(line, start, end - start)
                     results.append({
                         "page": page_index,
                         "rect": rect.as_tuple() if rect else None,
                         "snippet": line.text.strip()[:160],
                     })
-                    start = pos + max(1, len(needle))
+                    if len(results) >= MAX_SEARCH_RESULTS:
+                        break
             if len(results) >= MAX_SEARCH_RESULTS:
                 break
         return Result(request_id=req.request_id, kind=req.kind, doc_id=req.doc_id,
@@ -372,6 +465,24 @@ class PdfWorker:
                                "prepare_key": key if prepared.ok else None,
                                "issues": prepared.issues})
 
+    def _account_commit(self, state: _DocState, record: EditRecord) -> None:
+        """Fold a committed record into `changed_pages` (save-time checks, §12).
+
+        List-valued since M10: one page can carry several rebuilt lines from a
+        Replace-All batch, and every one of them is verified at save.
+        """
+        entries = record.pairs or [(record.region, record.edit)]
+        for region, edit in entries:
+            want = norm_cmp(edit.new_text)
+            gone = (norm_cmp(record.redacted_text) if region is None
+                    else norm_cmp(region.text))
+            exp, forb = state.changed_pages.get(record.page_index, ([], []))
+            if want and want not in exp:
+                exp.append(want)
+            if gone and gone != want and gone not in forb:
+                forb.append(gone)
+            state.changed_pages[record.page_index] = (exp, forb)
+
     def _on_commit_edit(self, req: Request) -> Result:
         state = self._doc(req)
         key = req.payload["prepare_key"]
@@ -381,22 +492,225 @@ class PdfWorker:
         pre_bytes = prepared.pre_bytes
         record = prepared.record
         new_rev = state.engine.commit(prepared)
-        page_index = record.page_index
+        self._account_commit(state, record)
         state.undo.append((pre_bytes, record))
         if len(state.undo) > UNDO_CAP:
             state.undo.pop(0)
         state.redo.clear()
-        want = " ".join(record.edit.new_text.split())
-        gone = (" ".join(record.region.text.split()) if record.region is not None
-                else " ".join(record.redacted_text.split()))
-        exp, forb = state.changed_pages.get(page_index, ("", ""))
-        state.changed_pages[page_index] = (
-            want if want else exp,
-            forb or (gone if gone != want else ""),
-        )
         return Result(request_id=req.request_id, kind=req.kind, doc_id=req.doc_id,
                       revision=new_rev, ok=True,
-                      payload={"revision": new_rev, "page": page_index,
+                      payload={"revision": new_rev, "page": record.page_index,
+                               "can_undo": bool(state.undo), "can_redo": False})
+
+    # -- replace all (M10) --------------------------------------------------------
+    def _on_replace_plan(self, req: Request) -> Result:
+        """Find every Replace-All match and build per-page candidates (M10).
+
+        Nothing is committed here: candidates exist so the review window can
+        show honest before/after renders and per-match skip reasons. The batch
+        is remembered worker-side; apply re-runs the same deterministic scan.
+        """
+        state = self._doc(req)
+        p = req.payload
+        query = str(p.get("query") or "")
+        replacement = str(p.get("replacement") or "")
+        match_case = bool(p.get("match_case"))
+        whole_word = bool(p.get("whole_word"))
+        auto_shrink = bool(p.get("auto_shrink"))
+        preview_zoom = float(p.get("preview_zoom", 2.0))
+        if not query:
+            return Result.failure(req, "Enter the text to find.")
+        engine = state.engine
+        counter = itertools.count(0)
+        matches: dict[int, dict] = {}
+        prepared_pages: dict[int, PreparedEdit] = {}
+        page_rects: dict[int, tuple] = {}
+        truncated = False
+        for page_index in range(engine.doc.page_count):
+            entries, trunc = _match_page_regions(
+                engine, req.doc_id or "", page_index, query,
+                match_case, whole_word, counter)
+            truncated = truncated or trunc
+            pairs: list[BatchPair] = []
+            for region, ranges, ids in entries:
+                snippet = region.lines[0].text.strip()[:160]
+                if not region.editable:
+                    for mid in ids:
+                        matches[mid] = {
+                            "id": mid, "page": page_index, "snippet": snippet,
+                            "status": "skipped",
+                            "reason": region.unsupported_reason or "This line cannot be edited.",
+                            "used_size": None, "font": "", "font_substituted": False,
+                        }
+                    continue
+                edit = ReplacementEdit(
+                    region_id=region.region_id, source_revision=engine.revision,
+                    new_text=apply_ranges(region.lines[0].text, ranges, replacement),
+                    mode=EditMode.PRESERVE_LINE, auto_shrink=auto_shrink,
+                    page_index=page_index)
+                pairs.append(BatchPair(region=region, edit=edit, match_ids=ids))
+                for mid in ids:
+                    matches[mid] = {
+                        "id": mid, "page": page_index, "snippet": snippet,
+                        "status": "planned", "reason": "",
+                        "used_size": None, "font": "", "font_substituted": False,
+                    }
+            if not pairs:
+                if truncated:
+                    break
+                continue
+            prepared, outcomes, change_rect = engine.prepare_page_edits(
+                page_index, pairs, preview_zoom)
+            outcome_by_id: dict[int, PairOutcome] = {}
+            for o in outcomes:
+                for mid in o.match_ids:
+                    outcome_by_id[mid] = o
+            ok = prepared is not None and prepared.ok
+            fallback = (prepared.issues[0]
+                        if prepared is not None and prepared.issues else None)
+            for mid, m in matches.items():
+                if m["page"] != page_index or m["status"] != "planned":
+                    continue
+                o = outcome_by_id.get(mid)
+                if o is not None and o.status == "skipped":
+                    m.update(status="skipped", reason=o.reason)
+                elif not ok:
+                    m.update(status="skipped",
+                             reason=fallback or "The edit was rejected during validation.")
+                elif o is not None:
+                    m.update(used_size=o.used_size, font=o.font_family,
+                             font_substituted=o.font_substituted, reason=o.reason)
+            if ok:
+                prepared_pages[page_index] = prepared
+                page_rects[page_index] = (
+                    (change_rect.x0, change_rect.y0, change_rect.x1, change_rect.y1)
+                    if change_rect is not None else None)
+            if truncated:
+                break
+
+        batch = _BatchPlan(
+            key=uuid.uuid4().hex, revision=engine.revision, query=query,
+            replacement=replacement, match_case=match_case, whole_word=whole_word,
+            auto_shrink=auto_shrink, matches=matches, prepared=prepared_pages,
+            page_rects=page_rects, preview_zoom=preview_zoom)
+        state.batch[batch.key] = batch
+        if len(state.batch) > MAX_BATCH_PLANS:
+            for old in list(state.batch)[:len(state.batch) - MAX_BATCH_PLANS]:
+                state.batch.pop(old, None)
+
+        ready = sum(1 for m in matches.values() if m["status"] == "planned")
+        pages_payload = []
+        for i, (page_index, prepared) in enumerate(prepared_pages.items()):
+            pages_payload.append({
+                "page": page_index,
+                "change_rect": batch.page_rects.get(page_index),
+                "preview_zoom": preview_zoom,
+                "before_png": prepared.before_png if i < MAX_PREVIEW_PAGES else None,
+                "after_png": prepared.preview_png if i < MAX_PREVIEW_PAGES else None,
+            })
+        return Result(request_id=req.request_id, kind=req.kind, doc_id=req.doc_id,
+                      revision=engine.revision, ok=True,
+                      payload={"batch_key": batch.key, "revision": engine.revision,
+                               "query": query,
+                               "matches": [matches[i] for i in sorted(matches)],
+                               "pages": pages_payload,
+                               "ready": ready,
+                               "skipped": len(matches) - ready,
+                               "total": len(matches),
+                               "truncated": truncated})
+
+    def _on_replace_apply(self, req: Request) -> Result:
+        """Commit the reviewed Replace-All pages as ONE undoable group (M10).
+
+        Candidates cannot be reused across commits (each is a whole-document
+        snapshot), so apply re-runs plan's deterministic scan page by page at
+        the current revision — prepare → commit → next page — and pushes a
+        single undo entry built from the first page's pre-batch bytes.
+        """
+        state = self._doc(req)
+        p = req.payload
+        batch = state.batch.pop(str(p.get("batch_key") or ""), None)
+        if batch is None:
+            return Result.failure(req, "This replace plan expired — run Replace All again.")
+        include = {int(i) for i in (p.get("include_ids") or [])}
+        if not include:
+            return Result(request_id=req.request_id, kind=req.kind, doc_id=req.doc_id,
+                          revision=state.engine.revision, ok=True,
+                          payload={"revision": state.engine.revision, "pages": [],
+                                   "replaced": 0, "skipped": [],
+                                   "query": batch.query,
+                                   "can_undo": bool(state.undo),
+                                   "can_redo": False})
+        engine = state.engine
+        if engine.revision != batch.revision:
+            return Result.failure(req, "The document changed since the review — "
+                                       "run Replace All again.")
+        counter = itertools.count(0)
+        pages_changed: list[int] = []
+        merged_pairs: list[tuple[TextRegion, ReplacementEdit]] = []
+        first_pre: bytes | None = None
+        replaced = 0
+        skipped: list[dict] = []
+        for page_index in range(engine.doc.page_count):
+            entries, _trunc = _match_page_regions(
+                engine, req.doc_id or "", page_index, batch.query,
+                batch.match_case, batch.whole_word, counter, include=include)
+            pairs = []
+            for region, ranges, ids in entries:
+                if not region.editable:
+                    continue
+                pairs.append(BatchPair(
+                    region=region,
+                    edit=ReplacementEdit(
+                        region_id=region.region_id, source_revision=engine.revision,
+                        new_text=apply_ranges(region.lines[0].text, ranges,
+                                              batch.replacement),
+                        mode=EditMode.PRESERVE_LINE, auto_shrink=batch.auto_shrink,
+                        page_index=page_index),
+                    match_ids=ids))
+            if not pairs:
+                continue
+            prepared, outcomes, _rect = engine.prepare_page_edits(
+                page_index, pairs, batch.preview_zoom)
+            for o in outcomes:
+                if o.status == "skipped":
+                    skipped.append({"page": page_index, "match_ids": o.match_ids,
+                                    "reason": o.reason})
+            if prepared is None or not prepared.ok:
+                issue = (prepared.issues[0] if prepared is not None and prepared.issues
+                         else "The edit was rejected during validation.")
+                for o in outcomes:
+                    if o.status == "planned":
+                        skipped.append({"page": page_index, "match_ids": o.match_ids,
+                                        "reason": issue})
+                continue
+            if first_pre is None:
+                first_pre = prepared.pre_bytes
+            engine.commit(prepared)
+            pages_changed.append(page_index)
+            record = prepared.record
+            merged_pairs.extend(record.pairs or [(record.region, record.edit)])
+            replaced += sum(len(o.match_ids) for o in outcomes if o.status == "planned")
+            self._account_commit(state, record)
+
+        if pages_changed and first_pre is not None:
+            merged_record = EditRecord(
+                region=merged_pairs[0][0], edit=merged_pairs[0][1],
+                resolved_family="", resolved_source="",
+                page_index=pages_changed[0],
+                pre_revision=batch.revision, post_revision=engine.revision,
+                pairs=merged_pairs)
+            # grouped undo: one entry for the whole batch (per-page pushes are
+            # deliberately skipped — Ctrl+Z undoes the entire Replace All)
+            state.undo.append((first_pre, merged_record))
+            if len(state.undo) > UNDO_CAP:
+                state.undo.pop(0)
+            state.redo.clear()
+        return Result(request_id=req.request_id, kind=req.kind, doc_id=req.doc_id,
+                      revision=engine.revision, ok=True,
+                      payload={"revision": engine.revision, "pages": pages_changed,
+                               "replaced": replaced, "skipped": skipped,
+                               "query": batch.query,
                                "can_undo": bool(state.undo), "can_redo": False})
 
     def _swap_doc(self, state: _DocState, doc_bytes: bytes, revision: int) -> None:
@@ -421,6 +735,7 @@ class PdfWorker:
                       revision=state.engine.revision, ok=True,
                       payload={"revision": state.engine.revision,
                                "page": record.page_index,
+                               "pages": _record_pages(record),
                                "can_undo": bool(state.undo),
                                "can_redo": bool(state.redo)})
 
@@ -436,6 +751,7 @@ class PdfWorker:
                       revision=state.engine.revision, ok=True,
                       payload={"revision": state.engine.revision,
                                "page": record.page_index,
+                               "pages": _record_pages(record),
                                "can_undo": bool(state.undo),
                                "can_redo": bool(state.redo)})
 

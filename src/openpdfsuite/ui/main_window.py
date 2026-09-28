@@ -15,17 +15,19 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEventLoop, QSize, Qt, QTimer
+from PySide6.QtCore import QEventLoop, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QColor,
+    QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
     QIcon,
     QKeySequence,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QDockWidget,
     QFileDialog,
@@ -34,6 +36,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QStackedWidget,
     QToolBar,
     QVBoxLayout,
@@ -42,10 +45,11 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..application.document_controller import DocumentController
+from ..application.update_service import UpdateService
 from ..domain.models import Color, DocxExportResult, EditMode, Rect, ReplacementEdit, TextAlignment
 from ..infrastructure.logging import get_logger
 from ..infrastructure.recovery import RecoveryStore
-from ..infrastructure.settings import Settings
+from ..infrastructure.settings import Settings, app_cache_dir
 from .dialogs.preview_dialog import OverflowDialog, PreviewDialog
 from .document_view import DocumentView
 from .panels import PropertiesPanel, SidebarTabs
@@ -148,6 +152,16 @@ class MainWindow(QMainWindow):
         if open_path:
             self.open_document(open_path)
 
+        self.update_service = UpdateService(self.settings, parent=self)
+        self.update_service.checked.connect(self._on_update_checked)
+        self.update_service.failed.connect(self._on_update_failed)
+        self.update_service.download_progress.connect(self._on_update_progress)
+        self.update_service.downloaded.connect(self._on_update_downloaded)
+        self._update_payload: dict | None = None
+        self._update_progress_dlg: QProgressDialog | None = None
+        self._manual_update_check = False
+        self._maybe_check_updates_on_start()
+
     # -- actions ----------------------------------------------------------------
     def _build_actions(self) -> None:
         def act(text, slot=None, shortcut=None, tip=None, enabled=True, checkable=False):
@@ -221,6 +235,9 @@ class MainWindow(QMainWindow):
         self.action_properties.setChecked(True)
         self.action_find = act("&Find…", self._focus_search, QKeySequence.Find,
                                "Search in this document")
+        self.action_replace = act("Rep&lace…", self._on_replace,
+                                  QKeySequence("Ctrl+H"),
+                                  "Replace text throughout the document")
 
         self.action_theme_light = act("&Light", lambda: self.theme.apply("light"),
                                       None, "Light theme", checkable=True)
@@ -240,13 +257,16 @@ class MainWindow(QMainWindow):
         self.action_reduced_motion.setChecked(self.settings.reduced_motion)
 
         self.action_about = act("&About openPDF suite", self._show_about, None, "About this app")
+        self.action_check_updates = act("Check for &Updates…", self._on_check_updates,
+                                        None, "Check GitHub for a newer version")
         self.action_limits = act("&Editing Limitations", self._show_limitations, None,
                                  "What openPDF suite can and cannot edit")
 
         self._save_actions = [self.action_save, self.action_save_as,
                               self.action_undo, self.action_redo]
         self._export_actions = [self.action_convert_to_word]
-        self._doc_actions = ([self.action_close_doc, self.action_find]
+        self._doc_actions = ([self.action_close_doc, self.action_find,
+                              self.action_replace]
                              + self._save_actions + self._export_actions)
         self._view_actions = [self.action_zoom_in, self.action_zoom_out,
                               self.action_fit_width, self.action_fit_page]
@@ -352,6 +372,7 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.action_redact_clear)
         m_edit.addSeparator()
         m_edit.addAction(self.action_find)
+        m_edit.addAction(self.action_replace)
 
         m_view = bar.addMenu("&View")
         m_view.addAction(self.action_zoom_in)
@@ -377,6 +398,8 @@ class MainWindow(QMainWindow):
         m_doc.addAction(self.action_limits)
 
         m_help = bar.addMenu("&Help")
+        m_help.addAction(self.action_check_updates)
+        m_help.addSeparator()
         m_help.addAction(self.action_about)
 
     def _populate_recents(self) -> None:
@@ -567,6 +590,7 @@ class MainWindow(QMainWindow):
         c.edit_prepared.connect(self._on_edit_prepared)
         c.edit_committed.connect(self._on_edit_committed)
         c.undo_redo_done.connect(self._on_undo_redo_done)
+        c.replace_applied.connect(self._on_replace_applied)
         c.saved.connect(self._on_saved)
         c.failure.connect(self._on_failure)
         c.snapshot_ready.connect(self._on_snapshot_ready)
@@ -989,14 +1013,51 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Edit applied (revision {revision}). Ctrl+Z to undo.", 5000)
 
-    def _on_undo_redo_done(self, revision, can_undo, can_redo, page) -> None:
+    def _on_undo_redo_done(self, revision, can_undo, can_redo, page, pages=None) -> None:
         self._pending_edit = None
         self._selected_region = None
         if self.view:
-            self.view.refresh_after_edit(page)
+            for p in (pages or [page]):
+                self.view.refresh_after_edit(p)
         self._update_action_availability()
         self._refresh_title()
         self.statusBar().showMessage(f"Now at revision {revision}.", 3000)
+
+    # -- replace all (M10) ------------------------------------------------------------
+    def _on_replace(self) -> None:
+        if not self._has_doc():
+            return
+        from .dialogs.replace_dialog import ReplaceDialog
+
+        dlg = ReplaceDialog(self, self.theme, self.controller)
+        dlg.apply_requested.connect(self._on_replace_apply_started)
+        dlg.exec()
+
+    def _on_replace_apply_started(self, query: str, count: int) -> None:
+        self.statusBar().showMessage(f"Replacing {count} match(es)…")
+
+    def _on_replace_applied(self, info: dict) -> None:
+        if not info.get("ok"):
+            self._update_action_availability()
+            return
+        pages = [int(p) for p in info.get("pages", [])]
+        if self.view:
+            for p in pages:
+                self.view.refresh_after_edit(p)
+        self._recovery_timer.start()
+        self._update_action_availability()
+        self._refresh_title()
+        replaced = int(info.get("replaced", 0))
+        skipped = info.get("skipped") or []
+        msg = (f"Replaced {replaced} match(es) on {len(pages)} page(s). "
+               f"Ctrl+Z undoes all of it.")
+        if skipped:
+            msg += f" {len(skipped)} match(es) were skipped (didn't fit or unsupported)."
+        self.statusBar().showMessage(msg, 9000)
+        # kill stale search highlights for the same needle by re-running search
+        query = (info.get("query") or "").strip()
+        if query and self.sidebar_tabs.search.field.text().strip().lower() == query.lower():
+            self._on_search_requested(query)
 
     # -- saving --------------------------------------------------------------------
     def _on_save(self) -> None:
@@ -1235,6 +1296,7 @@ class MainWindow(QMainWindow):
         c.edit_prepared.connect(self._on_edit_prepared)
         c.edit_committed.connect(self._on_edit_committed)
         c.undo_redo_done.connect(self._on_undo_redo_done)
+        c.replace_applied.connect(self._on_replace_applied)
         c.saved.connect(self._on_saved)
         c.failure.connect(self._on_failure)
         c.worker_crashed.connect(self._on_worker_crashed)
@@ -1611,6 +1673,136 @@ class MainWindow(QMainWindow):
             "leave this computer.</p>"
             "<p>PyMuPDF is used under the AGPL-3.0 — see THIRD_PARTY_NOTICES.md.</p>",
         )
+
+    # -- updates (M12, D21) ----------------------------------------------------
+    def _maybe_check_updates_on_start(self) -> None:
+        """Silent daily update check; network failures are ignored."""
+        if not self.settings.auto_check_updates:
+            return
+        from datetime import date
+
+        today = date.today().isoformat()
+        if self.settings.last_update_check == today:
+            return
+        self.settings.last_update_check = today
+        self.update_service.check(quiet=True)
+
+    def _on_check_updates(self) -> None:
+        self._manual_update_check = True
+        self.statusBar().showMessage("Checking for updates…", 5000)
+        self.update_service.check(quiet=False)
+
+    def _on_update_checked(self, payload) -> None:
+        manual = self._manual_update_check
+        self._manual_update_check = False
+        if payload is None:
+            if manual:
+                QMessageBox.information(
+                    self, "Up to date",
+                    f"openPDF suite {__version__} is the latest version.")
+            return
+        self._update_payload = payload
+        notes = (payload.get("notes") or "").strip()
+        if len(notes) > 700:
+            notes = notes[:700].rstrip() + " …"
+        box = QMessageBox(self)
+        box.setWindowTitle("Update available")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(f"openPDF suite {payload['tag']} is available "
+                    f"(you have {__version__}).")
+        box.setInformativeText(notes or "See the release page for what changed.")
+        download_btn = box.addButton("Download & install",
+                                     QMessageBox.ButtonRole.AcceptRole)
+        page_btn = box.addButton("Open release page",
+                                 QMessageBox.ButtonRole.HelpRole)
+        later_btn = box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(later_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is download_btn:
+            self._start_update_download()
+        elif clicked is page_btn:
+            QDesktopServices.openUrl(QUrl(payload.get("page", "")))
+
+    def _start_update_download(self) -> None:
+        payload = self._update_payload
+        if not payload:
+            return
+        total = max(1, int(payload.get("size", 0)))
+        self._update_progress_dlg = QProgressDialog(
+            f"Downloading {payload['tag']}…", "Cancel", 0, total, self)
+        self._update_progress_dlg.setWindowTitle("Downloading update")
+        self._update_progress_dlg.setMinimumDuration(0)
+        self._update_progress_dlg.setWindowModality(
+            Qt.WindowModality.WindowModal)
+        self._update_progress_dlg.canceled.connect(
+            self.update_service.cancel_download)
+        self.update_service.download(payload, app_cache_dir() / "updates")
+
+    def _close_update_progress(self) -> None:
+        dlg = self._update_progress_dlg
+        self._update_progress_dlg = None
+        if dlg is not None:
+            dlg.reset()
+            dlg.close()
+
+    def _on_update_progress(self, done: int, total: int) -> None:
+        dlg = self._update_progress_dlg
+        if dlg is None:
+            return
+        if total > 0:
+            dlg.setMaximum(total)
+            dlg.setValue(done)
+        else:
+            dlg.setRange(0, 0)  # busy indicator while size is unknown
+
+    def _on_update_failed(self, message: str) -> None:
+        self._close_update_progress()
+        QMessageBox.warning(self, "Update failed", message)
+
+    def _on_update_downloaded(self, result: dict) -> None:
+        self._close_update_progress()
+        path = result.get("path") or ""
+        if not path:
+            return  # canceled download
+        if not result.get("verified"):
+            mismatch = result.get("mismatch", False)
+            box = QMessageBox(self)
+            box.setWindowTitle("Installer integrity")
+            box.setIcon(QMessageBox.Icon.Warning)
+            if mismatch:
+                box.setText("The downloaded installer's checksum did not match "
+                            "the release. The file may be damaged or tampered "
+                            "with — it was NOT installed and should be deleted.")
+                box.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+            else:
+                box.setText("This release has no checksum sidecar, so the "
+                            "download cannot be verified. Install it anyway?")
+                box.addButton("Install anyway",
+                              QMessageBox.ButtonRole.AcceptRole)
+                box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+                page_btn = box.addButton("Open release page",
+                                         QMessageBox.ButtonRole.HelpRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if mismatch:
+                return
+            if clicked is page_btn:
+                QDesktopServices.openUrl(QUrl(result.get("page", "")))
+                return
+            if clicked is not None and clicked.text() != "Install anyway":
+                return
+        else:
+            answer = QMessageBox.question(
+                self, "Ready to install",
+                f"{result.get('tag', 'The new version')} was downloaded and "
+                "verified. Restart openPDF suite and run the installer now?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        from ..infrastructure.updater import spawn_installer
+
+        spawn_installer(Path(path))
+        QApplication.quit()
 
     def _show_limitations(self) -> None:
         box = QMessageBox(self)

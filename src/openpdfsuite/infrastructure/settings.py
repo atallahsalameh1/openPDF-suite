@@ -103,6 +103,24 @@ class Settings:
         self._q.setValue(f"docx/{key}", "true" if value else "false"
                          if isinstance(value, bool) else str(value))
 
+    # -- updates (M12) ----------------------------------------------------------
+    @property
+    def auto_check_updates(self) -> bool:
+        return bool(self._q.value("updates/auto_check", True, type=bool))
+
+    @auto_check_updates.setter
+    def auto_check_updates(self, value: bool) -> None:
+        self._q.setValue("updates/auto_check", bool(value))
+
+    @property
+    def last_update_check(self) -> str:
+        """ISO date of the last automatic update check (throttles startup)."""
+        return str(self._q.value("updates/last_check", ""))
+
+    @last_update_check.setter
+    def last_update_check(self, value: str) -> None:
+        self._q.setValue("updates/last_check", str(value))
+
     # -- window geometry ------------------------------------------------------
     def save_geometry(self, key: str, data) -> None:
         self._q.setValue(f"window/{key}/geometry", data)

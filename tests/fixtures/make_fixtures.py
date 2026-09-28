@@ -35,6 +35,13 @@ PARA_LINE4 = "Sphinx of black quartz, judge my vow."
 TRAILING = "End of first section."
 PAGE2_LINE = "Second page content stays untouched."
 ACCENTED = "Café naïve façade — résumé of Zürich straße."
+TIMES_LINES = [
+    "Chloë spent the naïve afternoon in Zürich.",
+    "A plain Times-Roman line for control.",
+]
+ARABIC_LINE = "هذا نص عربي للتجربة"
+ARABIC_MIXED = "Customer: عمر العلي — invoice 2026"
+ARABIC_CONTROL = "Plain English control line."
 LEFT_COL_HEAD = "Left column heading"
 RIGHT_COL_HEAD = "Right column heading"
 LEFT_COL_BODY = [
@@ -115,6 +122,47 @@ def make_unicode(path: Path) -> None:
         page.insert_text((72, 100), ACCENTED, fontsize=12, fontfile=str(arial), fontname="Arial")
     else:
         page.insert_text((72, 100), ACCENTED, fontsize=12, fontname="helv")
+    doc.save(path)
+    doc.close()
+
+
+def make_times_roman(path: Path) -> None:
+    """Base-14 Times-Roman (unembedded) — the user's ë case (M11)."""
+    doc = _new_doc()
+    page = doc.new_page(width=595, height=842)
+    y = 100
+    for line in TIMES_LINES:
+        page.insert_text((72, y), line, fontsize=12, fontname="tiro")
+        y += 20
+    doc.save(path)
+    doc.close()
+
+
+def make_arabic(path: Path) -> None:
+    """Arabic + mixed-bidi lines via the Story engine (M11).
+
+    insert_htmlbox is the same path the editor uses for RTL replacement:
+    shaped glyphs, and extraction that behaves like a real producer's file
+    (presentation-form codepoints, NFKC-comparable). insert_text would bake
+    raw glyphs in and extract garbage bidi order.
+    """
+    arial = Path("C:/Windows/Fonts/arial.ttf")
+    doc = _new_doc()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((72, 220), ARABIC_CONTROL, fontsize=12, fontname="helv")
+    if arial.exists():
+        arch = pymupdf.Archive()
+        arch.add(str(arial), "arial.ttf")
+        css = ("@font-face { font-family: opsarabic; src: url(arial.ttf); }\n"
+               "body { font-family: opsarabic; font-size: 14pt; margin: 1px; }")
+        page.insert_htmlbox(pymupdf.Rect(72, 90, 523, 116),
+                            f"<div>{ARABIC_LINE}</div>",
+                            css=css, archive=arch, scale_low=1)
+        page.insert_htmlbox(pymupdf.Rect(72, 130, 523, 156),
+                            f"<div>{ARABIC_MIXED}</div>",
+                            css=css, archive=arch, scale_low=1)
+    else:
+        page.insert_text((72, 100), ARABIC_LINE, fontsize=12, fontname="helv")
     doc.save(path)
     doc.close()
 
@@ -305,6 +353,8 @@ BUILDERS = {
     "wrapped_table.pdf": make_wrapped_table_cell,
     "embedded_font.pdf": make_embedded_font,
     "existing_redaction.pdf": make_existing_redaction,
+    "times_roman.pdf": make_times_roman,
+    "arabic.pdf": make_arabic,
 }
 
 

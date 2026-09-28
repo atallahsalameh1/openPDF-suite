@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pymupdf
 
+from .textnorm import norm_cmp
+
 
 class SaveError(Exception):
     """User-facing save failure; message must be actionable."""
@@ -23,12 +25,17 @@ class SaveError(Exception):
 
 @dataclass
 class SaveChecks:
-    """Expected outcomes used to validate the written candidate."""
+    """Expected outcomes used to validate the written candidate.
+
+    `expected_text`/`forbidden_text` are lists per page (M10): a Replace-All
+    batch can rebuild several lines of one page, and every one of them is
+    verified — not just the most recent edit.
+    """
 
     page_count: int
     changed_pages: set[int] = field(default_factory=set)
-    expected_text: dict[int, str] = field(default_factory=dict)  # page -> text that must appear
-    forbidden_text: dict[int, str] = field(default_factory=dict)  # page -> text that must be gone
+    expected_text: dict[int, list[str]] = field(default_factory=dict)  # page -> texts that must appear
+    forbidden_text: dict[int, list[str]] = field(default_factory=dict)  # page -> texts that must be gone
 
 
 def fingerprint_file(path: str | Path, chunk: int = 65536) -> str:
@@ -119,17 +126,19 @@ def _validate_candidate(tmp: Path, checks: SaveChecks) -> None:
                 raise SaveError(f"Changed page {p} missing in saved file.")
             page = check[p]
             page.get_pixmap(dpi=36)  # must render without error
-            text = page.get_text()
-            want = checks.expected_text.get(p)
-            if want and want not in " ".join(text.split()):
-                raise SaveError(
-                    f"Expected edited text missing on page {p + 1}. Original kept."
-                )
-            gone = checks.forbidden_text.get(p)
-            if gone and gone in " ".join(text.split()):
-                raise SaveError(
-                    f"Removed text still present on page {p + 1}. Original kept."
-                )
+            # NFKC comparison space (D20): shaped Arabic output extracts as
+            # presentation forms, expected/forbidden text is logical
+            text = norm_cmp(page.get_text())
+            for want in checks.expected_text.get(p, []):
+                if want and want not in text:
+                    raise SaveError(
+                        f"Expected edited text missing on page {p + 1}. Original kept."
+                    )
+            for gone in checks.forbidden_text.get(p, []):
+                if gone and gone in text:
+                    raise SaveError(
+                        f"Removed text still present on page {p + 1}. Original kept."
+                    )
     finally:
         check.close()
 

@@ -18,17 +18,54 @@ def test_installed_arial_resolves():
     assert not r.missing_glyphs
 
 
-def test_unknown_family_falls_back_to_builtin():
+def test_unknown_family_ascii_stays_builtin():
+    # baseline behavior preserved: plain Latin from an unknown family keeps
+    # using the Base-14 fallback (no embedding, no visual change)
     r = resolve_font(None, _ref("NoSuchFontXyz123"), set("plain text"))
     assert r.source == "builtin"
     assert r.builtin_name == "helv"
     assert r.substituted
+    assert not r.missing_glyphs
 
 
-def test_serif_fallback_is_times():
+def test_unknown_family_missing_glyph_swaps_to_installed():
+    # D20: when the builtin cannot render the characters (Base-14 has no
+    # Arabic), an installed covering font wins instead of a hard failure
+    r = resolve_font(None, _ref("NoSuchFontXyz123", serif=True), set("مرحبا"))
+    assert r.source == "installed", f"expected installed font, got {r.source}"
+    assert not r.missing_glyphs
+
+
+def test_serif_fallback_keeps_serif_look():
     r = resolve_font(None, _ref("NoSuchSerifXyz", serif=True), set("text"))
-    assert r.source == "builtin"
-    assert r.builtin_name == "tiro"
+    assert not r.missing_glyphs
+    if r.source == "installed":
+        assert "times" in r.family.lower() or "georgia" in r.family.lower() \
+            or "cambria" in r.family.lower()
+    else:
+        assert r.builtin_name == "tiro"
+
+
+def test_base14_times_missing_glyph_swaps_to_installed():
+    """The user-reported class: Base-14 has no Arabic — the resolver must swap
+    to an installed font that covers it instead of hard-failing (D20)."""
+    r = resolve_font(None, _ref("Times-Roman", serif=True), set("مرحبا"))
+    assert not r.missing_glyphs, "Arabic must resolve via an installed font now"
+    assert r.source == "installed", f"expected installed font, got {r.source}"
+    assert r.fontfile, "installed result carries the font file for embedding"
+
+
+def test_arabic_resolves_via_installed_font():
+    """Arabic replacement text must find an installed covering font (D20)."""
+    r = resolve_font(None, _ref("Arial"), set("عمر العلي"))
+    assert not r.missing_glyphs
+    assert r.source == "installed" and r.fontfile
+
+
+def test_original_family_preferred_when_it_covers():
+    r = resolve_font(None, _ref("Arial"), set("Hello World"))
+    assert r.family.lower() == "arial"
+    assert not r.substituted
 
 
 def test_bold_italic_uses_real_faces():
@@ -47,11 +84,11 @@ def test_user_choice_overrides():
         assert r.substituted
 
 
-def test_missing_glyphs_reported_for_latin1_builtin():
-    # builtin Helvetica cannot render CJK — resolver must say so honestly
-    r = resolve_font(None, _ref("NoSuchFontXyz123"), set("中文"), None)
-    if r.source == "builtin":
-        assert r.missing_glyphs, "CJK chars must be reported missing for builtin fallback"
+def test_missing_glyphs_reported_when_nothing_covers():
+    # U+0378 is unassigned — no installed font covers it; the resolver must
+    # say so honestly instead of silently dropping the character
+    r = resolve_font(None, _ref("NoSuchFontXyz123"), {"a", "\u0378"}, None)
+    assert r.missing_glyphs, "uncovered chars must be reported missing"
 
 
 def test_accented_latin_covered_by_builtin():

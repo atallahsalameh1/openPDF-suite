@@ -28,9 +28,13 @@ rotation 0).
 
 from __future__ import annotations
 
+import html
+import re
+import unicodedata
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from dataclasses import replace as dc_replace
 
 import pymupdf
 
@@ -48,6 +52,14 @@ from ...domain.models import (
 )
 from ..fonts.resolver import ResolvedFont, resolve_font
 from .extractor import extract_page_lines
+from .textnorm import (
+    has_presentation_forms,
+    needs_bidi,
+    nfkc_offset_map,
+    norm_cmp,
+    strip_invisibles,
+    to_logical,
+)
 
 _ALIGN_MAP = {
     TextAlignment.LEFT: pymupdf.TEXT_ALIGN_LEFT,
@@ -61,6 +73,59 @@ _PAD = 1.5  # pt inflation around the changed box for inside/outside splitting
 
 def _norm_ws(s: str) -> str:
     return " ".join(s.split())
+
+
+def find_line_matches(
+    text: str, needle: str, match_case: bool = False, whole_word: bool = False,
+) -> list[tuple[int, int]]:
+    """Char ranges of `needle` occurrences in one line's text (M10/M11).
+
+    Same line granularity and left-to-right non-overlapping semantics as the
+    worker's search. Whole-word mode guards against word characters on both
+    sides, so "cat" never matches inside "category" — including when the
+    needle itself starts or ends with punctuation.
+
+    Matching happens in NFKC space (D20): extraction returns Arabic/Hebrew as
+    presentation-form codepoints while users type logical characters, so both
+    sides are folded before comparing and ranges are mapped back to exact
+    indices of the ORIGINAL string. NFKC is identity for ordinary Latin text.
+    """
+    if not needle:
+        return []
+    hay, offsets = nfkc_offset_map(text)
+    ned = unicodedata.normalize("NFKC", needle)
+    if not match_case:
+        hay = hay.lower()
+        ned = ned.lower()
+    raw: list[tuple[int, int]] = []
+    if whole_word:
+        pattern = r"(?<!\w)" + re.escape(ned) + r"(?!\w)"
+        raw = [(m.start(), m.end()) for m in re.finditer(pattern, hay, 0)]
+    else:
+        start = 0
+        while (pos := hay.find(ned, start)) != -1:
+            raw.append((pos, pos + len(ned)))
+            start = pos + max(1, len(ned))
+    return [(offsets[s], offsets[e - 1] + 1) for s, e in raw]
+
+
+def apply_ranges(text: str, ranges: list[tuple[int, int]], replacement: str) -> str:
+    """Rebuild `text` with each [start, end) range swapped for `replacement` (M10).
+
+    Ranges come from `find_line_matches` and are non-overlapping and sorted;
+    sorting again keeps this safe for arbitrary subsets. One line with several
+    matches becomes one substituted line in a single pass.
+    """
+    if not ranges:
+        return text
+    out: list[str] = []
+    last = 0
+    for start, end in sorted(ranges):
+        out.append(text[last:start])
+        out.append(replacement)
+        last = end
+    out.append(text[last:])
+    return "".join(out)
 
 
 def _to_mupdf_rect(r: Rect) -> pymupdf.Rect:
@@ -77,6 +142,20 @@ def region_page_index(region: TextRegion) -> int:
     return int(part.split(":", 1)[0])
 
 
+def _canonical_rtl_text(edit: ReplacementEdit) -> ReplacementEdit:
+    """Bring extraction-space Arabic into logical space once (M11, D20).
+
+    Producers store shaped Arabic word-reversed (visual order); the Story
+    engine expects logical text and would double-reverse it. When the edit
+    text carries presentation forms (marks extraction origin, possibly mixed
+    with typed characters after a user edit), convert once here so shaping,
+    validation and the save checks all see the same canonical text.
+    """
+    if has_presentation_forms(edit.new_text):
+        return dc_replace(edit, new_text=to_logical(edit.new_text))
+    return edit
+
+
 @dataclass
 class EditRecord:
     """Everything needed to replay one committed edit deterministically (D5)."""
@@ -90,6 +169,9 @@ class EditRecord:
     post_revision: int
     redacted_text: str = ""  # text removed by a redaction commit (M9); feeds the
     # save-time forbidden-text check so removed text can never silently persist
+    # M10 Replace All: all (region, edit) pairs of a batched page commit. Empty
+    # for single edits — `region`/`edit` then describe the whole commit alone.
+    pairs: list[tuple[TextRegion, ReplacementEdit]] = field(default_factory=list)
 
 
 @dataclass
@@ -104,6 +186,32 @@ class PreparedEdit:
     pre_bytes: bytes | None = None  # working doc snapshot for undo
     before_png: bytes | None = None  # pre-edit page render for the compare view
     issues: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BatchPair:
+    """One line replacement inside a Replace-All batch (M10).
+
+    `match_ids` are the review-window match ids this pair folds (a line with
+    several occurrences of the needle is one pair). Identity lives in the
+    worker's batch, not here.
+    """
+
+    region: TextRegion
+    edit: ReplacementEdit
+    match_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class PairOutcome:
+    """Per-pair verdict of a batch prepare: planned or skipped with reason (M10)."""
+
+    match_ids: list[int]
+    status: str  # "planned" | "skipped"
+    reason: str = ""  # skip reason, or shrink/substitution note when planned
+    used_size: float | None = None
+    font_family: str = ""
+    font_substituted: bool = False
 
 
 class PdfEditEngine:
@@ -173,6 +281,45 @@ class PdfEditEngine:
                 best = min(best, line.bbox.x0 - 1.0)
         return best
 
+    def _batch_right_limit(
+        self, page: pymupdf.Page, region: TextRegion, other_regions: list[TextRegion],
+    ) -> float:
+        """Right-edge x for a batched Mode A insertion, from the ORIGINAL page (M10).
+
+        Measured before any redaction so it is stable: the nearest line on the
+        same baseline caps the width. A neighbour that is itself being replaced
+        contributes its insertion origin (its new text starts exactly there),
+        so two rebuilt cells of one table row can never overlap each other.
+        """
+        own = region.lines[0]
+        base_y = own.baseline_y
+        own_x = own.runs[0].origin.x
+        # Only RIGHT-side replaced neighbours cap the width: a replaced cell to
+        # the LEFT of this one does not shrink the space available to it (its
+        # origin would even sit before ours, zeroing the gap — M10 fix after
+        # real-world two-cells-per-baseline rows skipped every match).
+        replaced_origins = {
+            round(o.lines[0].runs[0].origin.x, 2)
+            for o in other_regions
+            if o is not region
+            and abs(o.lines[0].baseline_y - base_y) <= 2.0
+            and o.lines[0].runs[0].origin.x > own_x + 0.5
+        }
+        best = page.rect.width - 4.0
+        for line in extract_page_lines(page, with_chars=False):
+            if line.direction != Direction.HORIZONTAL:
+                continue
+            if abs(line.baseline_y - base_y) > 2.0:
+                continue
+            x = line.runs[0].origin.x
+            if abs(x - own_x) < 0.5:
+                continue  # the region's own line
+            if round(x, 2) in replaced_origins:
+                best = min(best, x - 1.0)
+            elif line.bbox.x0 > own.bbox.x1 - 0.5:
+                best = min(best, line.bbox.x0 - 1.0)
+        return best
+
     def _fit_size(self, scratch_page: Callable[[], pymupdf.Page], box: Rect, text: str,
                   fontname: str, start: float, align: int, color) -> float:
         """Largest size <= start that fits `text` in `box` (binary search)."""
@@ -193,12 +340,13 @@ class PdfEditEngine:
                 break
         return round(best * 2) / 2  # round down to half points
 
-    def _redact_region(self, page: pymupdf.Page, region: TextRegion) -> None:
-        """Char-aware bounded redaction of exactly the source text (D6).
+    def _add_region_redact_annots(self, page: pymupdf.Page, region: TextRegion) -> None:
+        """Char-aware bounded redact annots for exactly the source text (D6).
 
         Consecutive char boxes are merged into segments to keep the annot count
         sane while staying tight enough that neighbors are not touched.
-        `fill=False` means no paint-over: backgrounds survive.
+        `fill=False` means no paint-over: backgrounds survive. Callers apply
+        once after adding annots for every region (batch path reuses this).
         """
         for line in region.lines:
             for run in line.runs:
@@ -213,6 +361,9 @@ class PdfEditEngine:
                     page.add_redact_annot(_to_mupdf_rect(seg), fill=False)
                 else:
                     page.add_redact_annot(_to_mupdf_rect(run.bbox), fill=False)
+
+    def _redact_region(self, page: pymupdf.Page, region: TextRegion) -> None:
+        self._add_region_redact_annots(page, region)
         page.apply_redactions(
             images=pymupdf.PDF_REDACT_IMAGE_NONE,
             graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
@@ -221,14 +372,19 @@ class PdfEditEngine:
     def _insert_mode_a(
         self, page: pymupdf.Page, region: TextRegion, edit: ReplacementEdit,
         resolved: ResolvedFont, fontname: str, size: float, color: Color,
-        validation: ValidationResult,
+        validation: ValidationResult, limit: float | None = None,
     ) -> tuple[float, Rect | None]:
-        """Insert one line at the original baseline. Returns (used_size, extent)."""
+        """Insert one line at the original baseline. Returns (used_size, extent).
+
+        `limit` overrides the right-neighbour measurement (M10 batch path: the
+        caller computes it from the ORIGINAL page, capping at a replaced
+        neighbour's insertion origin so two rebuilt cells cannot overlap).
+        """
         origin = region.lines[0].runs[0].origin
         text = _norm_ws(edit.new_text)
         width = self._measure(resolved, text, size)
-        limit = self._right_neighbor_limit(page, region)
-        available = max(8.0, limit - origin.x)
+        right = self._right_neighbor_limit(page, region) if limit is None else limit
+        available = max(8.0, right - origin.x)
         used_size = size
         if width > available:
             validation.overflowed = True
@@ -277,6 +433,108 @@ class PdfEditEngine:
             raise OverflowError("Replacement text overflows the text box.")
         return size, box
 
+    # -- shaped insertion (RTL / bidi scripts, M11+D20) ----------------------------
+    _SHAPE_FONT_URL = "opsfont.ttf"
+
+    def _shaped_css(self, resolved: ResolvedFont, size: float, color: Color) -> str:
+        r, g, b = (round(c * 255) for c in color.as_tuple())
+        if resolved.fontfile or resolved.fontbuffer:
+            fam = "OPSFont"
+            face = (f"@font-face {{font-family: {fam}; "
+                    f"src: url({self._SHAPE_FONT_URL});}}\n")
+        else:
+            fam = "helvetica"
+            face = ""
+        return (f"{face}body {{font-family: {fam}; font-size: {size:g}pt; "
+                f"line-height: 1.05; color: rgb({r}, {g}, {b}); margin: 0px;}}")
+
+    def _shaped_archive(self, resolved: ResolvedFont) -> pymupdf.Archive | None:
+        if resolved.fontfile:
+            arch = pymupdf.Archive()
+            arch.add(resolved.fontfile, self._SHAPE_FONT_URL)
+            return arch
+        if resolved.fontbuffer:
+            arch = pymupdf.Archive()
+            arch.add(resolved.fontbuffer, self._SHAPE_FONT_URL)
+            return arch
+        return None
+
+    def _shaped_box(self, line_bbox: Rect, right_limit: float, size: float) -> Rect:
+        """Layout box for a shaped (RTL) line: the original line's box grown
+        to the same right-edge limit Mode A uses, so a longer replacement has
+        room before it would collide with a neighbour (then it wraps and the
+        vertical fit check rejects it honestly)."""
+        return Rect(line_bbox.x0, line_bbox.y0,
+                    max(line_bbox.x1, right_limit),
+                    line_bbox.y1 + max(1.0, size * 0.2))
+
+    def _shaped_width(
+        self, resolved: ResolvedFont, text: str, size: float, color: Color,
+    ) -> float:
+        """Laid-out width of a shaped line, on a scratch page (M11/D20).
+
+        text_length is meaningless for shaped bidi output, so the real Story
+        layout measures it: huge box, single line, read the line bbox.
+        """
+        scratch = pymupdf.open()
+        try:
+            sp = scratch.new_page(width=1000, height=100)
+            sp.insert_htmlbox(
+                pymupdf.Rect(10, 10, 990, 90),
+                f"<div>{html.escape(strip_invisibles(text))}</div>",
+                css=self._shaped_css(resolved, size, color),
+                archive=self._shaped_archive(resolved), scale_low=1)
+            lines = [ln for b in sp.get_text("dict")["blocks"] if b.get("type") == 0
+                     for ln in b["lines"]]
+            if not lines:
+                return 0.0
+            x0 = min(ln["bbox"][0] for ln in lines)
+            x1 = max(ln["bbox"][2] for ln in lines)
+            return x1 - x0
+        finally:
+            scratch.close()
+
+    def _fit_shaped_size(
+        self, resolved: ResolvedFont, text: str, start: float, color: Color,
+        available: float,
+    ) -> float | None:
+        """Largest size <= start (half-point steps) whose shaped width fits."""
+        lo, hi = 4.0, start
+        best = None
+        for _ in range(10):
+            mid = (lo + hi) / 2
+            if self._shaped_width(resolved, text, mid, color) <= available:
+                best = round(mid * 2) / 2
+                lo = mid
+            else:
+                hi = mid
+            if hi - lo < 0.25:
+                break
+        return best
+
+    def _insert_shaped_line(
+        self, page: pymupdf.Page, region: TextRegion, edit: ReplacementEdit,
+        resolved: ResolvedFont, size: float, color: Color, right_limit: float,
+    ) -> Rect:
+        """Insert an RTL/bidi line via the Story engine (M11, D20).
+
+        MuPDF shapes with HarfBuzz and applies its own bidi, producing real,
+        extractable PDF text (probe: scripts/probe_rtl.py). The text anchors
+        to the line's BOX — an RTL line preserves its box, not the exact
+        baseline (documented deviation). `scale_low=1` refuses to shrink
+        silently; no fit raises OverflowError like Mode A overflow.
+        """
+        box = self._shaped_box(region.lines[0].bbox, right_limit, size)
+        # strip invisible formatting first: Story treats soft hyphens as
+        # hyphenation points and drops them, which would change the text
+        markup = f"<div>{html.escape(strip_invisibles(edit.new_text))}</div>"
+        spare, _scale = page.insert_htmlbox(
+            _to_mupdf_rect(box), markup, css=self._shaped_css(resolved, size, color),
+            archive=self._shaped_archive(resolved), scale_low=1)
+        if spare < 0:
+            raise OverflowError("Replacement text does not fit the line box.")
+        return box
+
     # -- prepare ---------------------------------------------------------------
     def prepare(
         self,
@@ -292,6 +550,7 @@ class PdfEditEngine:
             return PreparedEdit(ok=False, candidate_bytes=None, validation=validation,
                                 preview_png=None, record=None, issues=reported)
 
+        edit = _canonical_rtl_text(edit)
         if region.revision != self.revision or edit.source_revision != self.revision:
             return fail(ValidationResult(ok=False), ["Stale region: the document changed."])
         cap = self.capability(page_index, region)
@@ -355,8 +614,40 @@ class PdfEditEngine:
 
                 try:
                     if edit.mode == EditMode.PRESERVE_LINE:
-                        used_size, extent = self._insert_mode_a(
-                            page, region, edit, resolved, fontname, size, color, validation)
+                        if needs_bidi(edit.new_text):
+                            # shaped path: measured width against the same
+                            # right-edge limit as Mode A (§9 overflow choices,
+                            # shrink only on explicit opt-in like Mode A)
+                            limit = self._right_neighbor_limit(page, region)
+                            available = max(8.0, limit - region.lines[0].bbox.x0)
+                            width = self._shaped_width(resolved, edit.new_text,
+                                                       size, color)
+                            used_size = size
+                            if width > available:
+                                required = self._fit_shaped_size(
+                                    resolved, edit.new_text, size, color, available)
+                                validation.overflowed = True
+                                validation.overflow_px = width - available
+                                validation.required_size = required
+                                if edit.auto_shrink and required:
+                                    used_size = required
+                                    width = self._shaped_width(
+                                        resolved, edit.new_text, used_size, color)
+                                    validation.overflowed = width > available
+                                    validation.issues.append(
+                                        f"Text auto-shrunk to {used_size:g} pt to "
+                                        f"fit the line.")
+                                else:
+                                    raise OverflowError(
+                                        "Replacement is wider than the available "
+                                        "space and would collide with neighboring "
+                                        "text.")
+                            extent = self._insert_shaped_line(
+                                page, region, edit, resolved, used_size, color, limit)
+                        else:
+                            used_size, extent = self._insert_mode_a(
+                                page, region, edit, resolved, fontname, size, color,
+                                validation)
                     else:
                         used_size, extent = self._insert_mode_b(
                             page, region, edit, resolved, fontname, size, color,
@@ -753,6 +1044,218 @@ class PdfEditEngine:
             before_png=before.tobytes("png"),
         )
 
+    # -- batch replacement (M10: Replace All) ------------------------------------
+    def prepare_page_edits(
+        self, page_index: int, pairs: list[BatchPair], preview_zoom: float = 2.0,
+    ) -> tuple[PreparedEdit | None, list[PairOutcome], Rect | None]:
+        """Replace several lines of one page in a single validated candidate (M10).
+
+        The Replace-All batching unit: all planned line replacements of one page
+        go through one redact + insert + validate pass on an isolated candidate,
+        exactly like a single Mode A edit — one commit, one revision bump per
+        page. Pairs that cannot work (stale, not editable, missing glyphs,
+        would not fit, empty result) are skipped with a reason instead of
+        failing the whole page.
+
+        Returns (prepared, outcomes, change_rect): `prepared` is None when every
+        pair was skipped; `change_rect` is the display-space union of the
+        planned changes (identity for preview cropping), None on failure.
+        A page-level validation failure returns ok=False with the planned
+        outcomes intact — the caller flips them to skipped.
+        """
+        outcomes: list[PairOutcome] = []
+        planned: list[tuple[BatchPair, ResolvedFont, float, Color]] = []
+        font_cache: dict[tuple, ResolvedFont] = {}
+        substituted: list[str] = []
+        validation = ValidationResult(ok=True)
+        all_regions = [p.region for p in pairs]
+
+        def _skip(pair: BatchPair, reason: str) -> None:
+            outcomes.append(PairOutcome(pair.match_ids, "skipped", reason))
+
+        for pair in pairs:
+            region, edit = pair.region, pair.edit
+            edit = _canonical_rtl_text(edit)
+            pair.edit = edit
+            if region.revision != self.revision or edit.source_revision != self.revision:
+                _skip(pair, "The document changed — re-run Replace All.")
+                continue
+            cap = self.capability(page_index, region)
+            if not cap.editable:
+                _skip(pair, cap.reason)
+                continue
+            if edit.mode != EditMode.PRESERVE_LINE:
+                _skip(pair, "Replace All rebuilds whole lines; this match has no "
+                            "line-level replacement.")
+                continue
+            new_text = _norm_ws(edit.new_text)
+            if not new_text:
+                _skip(pair, "Replacement would leave the line empty — use Black "
+                            "Out Text to delete text.")
+                continue
+            dom = region.dominant_font
+            size = edit.size_override or dom.size
+            color = edit.color_override or dom.color
+            cache_key = (dom.name, dom.size, dom.bold, dom.italic,
+                         edit.font_override, frozenset(new_text))
+            resolved = font_cache.get(cache_key)
+            if resolved is None:
+                resolved = resolve_font(
+                    self.doc, dom, set(new_text),
+                    bold=edit.bold_override, italic=edit.italic_override,
+                    user_choice=edit.font_override)
+                font_cache[cache_key] = resolved
+            if resolved.missing_glyphs:
+                _skip(pair, f"Font {resolved.family} cannot render: "
+                            f"{''.join(resolved.missing_glyphs[:10])}")
+                continue
+
+            # Width: LTR pairs measure against the ORIGINAL page (pre-redaction,
+            # so a replaced neighbour cell caps at its insertion origin). RTL
+            # pairs use the real shaped layout width (text_length is meaningless
+            # for bidi output) against the same right-edge limit (D20).
+            origin = region.lines[0].runs[0].origin
+            used_size = size
+            note = ""
+            if needs_bidi(new_text):
+                limit = self._batch_right_limit(self.doc[page_index], region,
+                                                all_regions)
+                available = max(8.0, limit - region.lines[0].bbox.x0)
+                width = self._shaped_width(resolved, new_text, size, color)
+                if width > available:
+                    required = self._fit_shaped_size(resolved, new_text, size,
+                                                     color, available)
+                    if edit.auto_shrink and required:
+                        used_size = required
+                    else:
+                        _skip(pair, f"Replacement is {width - available:.0f} pt wider "
+                                    f"than the line's free space — shorten it or turn "
+                                    f"on 'Shrink to fit'.")
+                        continue
+            else:
+                limit = self._batch_right_limit(self.doc[page_index], region,
+                                                all_regions)
+                available = max(8.0, limit - origin.x)
+                width = self._measure(resolved, new_text, size)
+                if width > available:
+                    required = max(4.0, round(size * available / width * 2) / 2)
+                    if edit.auto_shrink and required >= 4.0:
+                        shrunk = self._measure(resolved, new_text, required)
+                        if shrunk > available:
+                            _skip(pair, f"Does not fit even shrunk to {required:g} pt — "
+                                        f"shorten the replacement.")
+                            continue
+                        used_size = required
+                        width = shrunk
+                    else:
+                        _skip(pair, f"Replacement is {width - available:.0f} pt wider "
+                                    f"than the line's free space — shorten it or turn "
+                                    f"on 'Shrink to fit'.")
+                        continue
+            if used_size != size:
+                note = f"Text shrunk to {used_size:g} pt to fit the line."
+            if resolved.substituted:
+                if resolved.family not in substituted:
+                    substituted.append(resolved.family)
+                note = (note + " " if note else "") + \
+                    f"Original font unavailable. Using {resolved.family}."
+            outcomes.append(PairOutcome(
+                pair.match_ids, "planned", note, used_size=used_size,
+                font_family=resolved.family,
+                font_substituted=bool(resolved.substituted)))
+            planned.append((pair, resolved, used_size, color))
+
+        if not planned:
+            return None, outcomes, None
+
+        if substituted:
+            validation.substituted_font = substituted[0]
+
+        pre_bytes = self.doc.tobytes()
+        candidate = pymupdf.open(stream=pre_bytes)
+        display: Rect | None = None
+        try:
+            page = candidate[page_index]
+            for pair, _resolved, _size, _color in planned:
+                self._add_region_redact_annots(page, pair.region)
+            page.apply_redactions(
+                images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+            )
+
+            font_tags: dict[tuple, str] = {}
+            change_box: Rect | None = None
+            for n, (pair, resolved, used_size, color) in enumerate(planned):
+                line = pair.region.lines[0]
+                if needs_bidi(pair.edit.new_text):
+                    extent = self._insert_shaped_line(
+                        page, pair.region, pair.edit, resolved, used_size, color,
+                        self._batch_right_limit(
+                            page, pair.region, [p.region for p, *_ in planned]))
+                else:
+                    key = (resolved.source, resolved.builtin_name, resolved.family)
+                    fontname = font_tags.get(key)
+                    if fontname is None:
+                        fontname = self._register_font(page, resolved, f"B{page_index}N{n}")
+                        font_tags[key] = fontname
+                    text = _norm_ws(pair.edit.new_text)
+                    origin = line.runs[0].origin
+                    page.insert_text((origin.x, origin.y), text, fontsize=used_size,
+                                     fontname=fontname, color=color.as_tuple())
+                    extent = Rect(origin.x, line.bbox.y0,
+                                  origin.x + self._measure(resolved, text, used_size),
+                                  line.bbox.y1)
+                change_box = _union(_union(change_box or pair.region.bbox,
+                                           pair.region.bbox), extent)
+
+            padded = change_box.inflated(_PAD, _PAD)
+            self._validate_batch_extraction(candidate[page_index], page_index,
+                                            planned, padded, validation)
+            before_png = None
+            after = None
+            if validation.ok:
+                before = self.doc[page_index].get_pixmap(
+                    matrix=pymupdf.Matrix(preview_zoom, preview_zoom))
+                after = candidate[page_index].get_pixmap(
+                    matrix=pymupdf.Matrix(preview_zoom, preview_zoom))
+                display = self._display_rect(page_index, padded)
+                self._validate_pixels(before, after, display, preview_zoom, validation)
+                before_png = before.tobytes("png")
+            if not validation.ok:
+                candidate.close()
+                return PreparedEdit(
+                    ok=False, candidate_bytes=None, validation=validation,
+                    preview_png=None, record=None,
+                    issues=list(dict.fromkeys(validation.issues))), outcomes, None
+
+            preview_png = after.tobytes("png")
+            cand_bytes = candidate.tobytes(deflate=True)
+            candidate.close()
+        except Exception as exc:  # engine failure must never corrupt the working doc
+            try:
+                candidate.close()
+            except Exception:
+                pass
+            return PreparedEdit(
+                ok=False, candidate_bytes=None,
+                validation=ValidationResult(ok=False), preview_png=None, record=None,
+                issues=[f"Edit failed: {exc}"]), outcomes, None
+
+        first_pair, first_resolved, _size, _color = planned[0]
+        record = EditRecord(
+            region=first_pair.region, edit=first_pair.edit,
+            resolved_family=first_resolved.family,
+            resolved_source=first_resolved.source,
+            page_index=page_index,
+            pre_revision=self.revision, post_revision=self.revision + 1,
+            pairs=[(p.region, p.edit) for p, *_ in planned],
+        )
+        return PreparedEdit(
+            ok=True, candidate_bytes=cand_bytes, validation=validation,
+            preview_png=preview_png, record=record, pre_bytes=pre_bytes,
+            before_png=before_png,
+        ), outcomes, display
+
     # -- commit ------------------------------------------------------------------
     def commit(self, prepared: PreparedEdit) -> int:
         """Swap the working document for the validated candidate. Returns new revision."""
@@ -775,22 +1278,46 @@ class PdfEditEngine:
         r = _to_mupdf_rect(rect) * self.doc[page_index].rotation_matrix
         return Rect(r.x0, r.y0, r.x1, r.y1)
 
+    def _baseline_clusters(self, cand_page: pymupdf.Page, padded: Rect) -> list[str]:
+        """Norm-cmp'd text per baseline cluster of lines inside `padded` (D20).
+
+        A shaped rebuild can emit its Latin and Arabic parts as separate
+        extraction fragments sharing one baseline (sometimes with overlapping
+        x-ranges). Joining each baseline cluster x-sorted reconstructs the
+        line text; containment checks then work per cluster instead of
+        depending on fragment adjacency in the global extraction order.
+        """
+        inside = [ln for ln in extract_page_lines(cand_page, with_chars=False)
+                  if ln.bbox.intersects(padded)]
+        inside.sort(key=lambda ln: ln.bbox.y0)
+        clusters: list[list] = []
+        for ln in inside:
+            if clusters and abs(ln.bbox.y0 - clusters[-1][0].bbox.y0) <= 3.0:
+                clusters[-1].append(ln)
+            else:
+                clusters.append([ln])
+        return [norm_cmp(" ".join(ln.text for ln
+                                  in sorted(group, key=lambda ln: ln.bbox.x0)))
+                for group in clusters]
+
     def _validate_extraction(
         self, cand_page: pymupdf.Page, page_index: int, region: TextRegion,
         edit: ReplacementEdit, padded: Rect, validation: ValidationResult,
     ) -> None:
-        cand_lines = extract_page_lines(cand_page, with_chars=False)
-        inside = [ln for ln in cand_lines if ln.bbox.intersects(padded)]
-        outside_after = [ln for ln in cand_lines if not ln.bbox.intersects(padded)]
-        inside_text = _norm_ws(" ".join(ln.text for ln in inside))
+        cluster_texts = self._baseline_clusters(cand_page, padded)
+        inside_text = " ".join(cluster_texts)
 
-        want = _norm_ws(edit.new_text)
-        if want and _norm_ws(inside_text) != want and want not in inside_text:
+        want = norm_cmp(edit.new_text)
+        # containment in one baseline cluster (fragmented shaped rebuilds) or
+        # in the joined area text (Mode B reflow wraps across baselines)
+        if want and (want not in inside_text
+                     and not any(want in ct for ct in cluster_texts)):
             validation.ok = False
             validation.issues.append(
-                "Verification failed: replacement text not found where expected."
+                "Verification failed: replacement text not found where expected. "
+                f"Found there instead: {inside_text[:80]!r}"
             )
-        source_text = _norm_ws(region.text)
+        source_text = norm_cmp(region.text)
         # Retaining the original sentence inside the requested replacement is
         # legitimate (for example, appending a word). Only flag source text
         # that appears in the output but was not requested by the user.
@@ -800,22 +1327,128 @@ class PdfEditEngine:
                 "Verification failed: original text still present in the edited region."
             )
 
+        self._validate_outside_lines(cand_page, page_index, padded, validation)
+
+    def _validate_outside_lines(
+        self, cand_page: pymupdf.Page, page_index: int, padded: Rect,
+        validation: ValidationResult,
+    ) -> None:
+        """Text outside the padded change area must be unchanged (M11 rewrite).
+
+        MuPDF rewrites the page content stream on `apply_redactions`, which
+        can REGROUP extraction lines page-wide (table columns merge into row
+        lines; measured 137 -> 135 lines on a real file) — a positional
+        line-by-line comparison false-alarms on such files. The robust
+        invariant is the character INVENTORY of all outside text (order-free,
+        NFKC space); pixel validation covers the visual side (moved/swapped
+        text cannot hide from it).
+        """
+        cand_lines = extract_page_lines(cand_page, with_chars=False)
+        outside_after = [ln for ln in cand_lines if not ln.bbox.intersects(padded)]
         orig_lines = extract_page_lines(self.doc[page_index], with_chars=False)
         outside_before = [ln for ln in orig_lines if not ln.bbox.intersects(padded)]
-        if len(outside_before) != len(outside_after):
+        before_text = norm_cmp(
+            " ".join(ln.text for ln in outside_before)).replace(" ", "")
+        after_text = norm_cmp(
+            " ".join(ln.text for ln in outside_after)).replace(" ", "")
+        if before_text != after_text:
             validation.collateral_change = True
-        else:
-            for b, a in zip(outside_before, outside_after, strict=True):
-                if _norm_ws(b.text) != _norm_ws(a.text) or (
-                    abs(b.bbox.x0 - a.bbox.x0) > 1.5 or abs(b.bbox.y0 - a.bbox.y0) > 1.5
-                ):
-                    validation.collateral_change = True
-                    break
         if validation.collateral_change:
+            lost = Counter(before_text) - Counter(after_text)
+            extra = Counter(after_text) - Counter(before_text)
+            detail = ""
+            if lost:
+                sample = "".join(ch for ch, n in list(lost.items())[:12] for _ in range(n))
+                detail += f" deleted {sum(lost.values())} chars ({sample!r}…)"
+            if extra:
+                sample = "".join(ch for ch, n in list(extra.items())[:12] for _ in range(n))
+                detail += f" gained {sum(extra.values())} chars ({sample!r}…)"
             validation.ok = False
             validation.issues.append(
                 "Edit rejected: text outside the selected region would change."
+                + detail
             )
+
+    def _validate_batch_extraction(
+        self, cand_page: pymupdf.Page, page_index: int,
+        planned: list[tuple[BatchPair, ResolvedFont, float, Color]], padded: Rect,
+        validation: ValidationResult,
+    ) -> None:
+        """Multi-pair line-level check for Replace All (M10, NFKC per D20).
+
+        Line-text multiset inside the padded change area: after must equal
+        (before − sources) + wants. Unlike substring containment this survives
+        duplicate lines elsewhere in the area (e.g. a match count truncated at
+        the cap leaving an identical line untouched next to a replaced one).
+        Unchanged neighbours must not move textually; pixels cover the rest.
+
+        Bidi re-fragmentation allowance (D20): a shaped rebuild can split one
+        extracted line into per-bidi-run fragments (pure Arabic lines keep one
+        line, mixed Arabic/Latin lines split). When the raw multiset differs,
+        the page still passes if the joined text is character-identical AND
+        every pair's substitution verifiably happened.
+        """
+        before = Counter(
+            norm_cmp(ln.text)
+            for ln in extract_page_lines(self.doc[page_index], with_chars=False)
+            if ln.bbox.intersects(padded)
+        )
+        after = Counter(
+            norm_cmp(ln.text)
+            for ln in extract_page_lines(cand_page, with_chars=False)
+            if ln.bbox.intersects(padded)
+        )
+        sources = Counter(norm_cmp(p.region.text) for p, *_ in planned)
+        wants = Counter(t for t in (norm_cmp(p.edit.new_text) for p, *_ in planned) if t)
+        expected = (before - sources) + wants
+        if after != expected:
+            joined_before = norm_cmp(" ".join(before.elements()))
+            joined_after = norm_cmp(" ".join(after.elements()))
+            # Bidi re-fragmentation + word-order canonicalisation (D20): a
+            # shaped rebuild splits lines and yields logical-order Arabic while
+            # the source was visual-order — compare the CHARACTER inventory
+            # (order-free) and prove the substitution per pair instead.
+            before_chars = Counter(joined_before.replace(" ", ""))
+            after_chars = Counter(joined_after.replace(" ", ""))
+            src_chars = Counter(norm_cmp(
+                " ".join(p.region.text for p, *_ in planned)).replace(" ", ""))
+            want_chars = Counter(norm_cmp(
+                " ".join(p.edit.new_text for p, *_ in planned)).replace(" ", ""))
+            reflowed = after_chars == (before_chars - src_chars) + want_chars
+            if reflowed:
+                # the substitution itself must still be proven per pair:
+                # inside one baseline cluster (fragmented shaped rebuilds) or
+                # in the joined band text (Mode B reflow wraps baselines)
+                cluster_texts = self._baseline_clusters(cand_page, padded)
+                joined_after = norm_cmp(" ".join(after.elements()))
+                for pair, *_ in planned:
+                    w = norm_cmp(pair.edit.new_text)
+                    s = norm_cmp(pair.region.text)
+                    found = (w in joined_after
+                             or any(w in ct for ct in cluster_texts))
+                    retained = (s in joined_after
+                                and s not in w
+                                and not any(s in ct for ct in cluster_texts))
+                    if w and not found:
+                        reflowed = False
+                        break
+                    if s and retained:
+                        reflowed = False
+                        break
+            if not reflowed:
+                validation.ok = False
+                lost = before - after - sources
+                extra = after - before - wants
+                detail = ""
+                if lost:
+                    detail += f" lost {sum(lost.values())} line(s) ({list(lost)[:2]!r})"
+                if extra:
+                    detail += f" gained {sum(extra.values())} line(s) ({list(extra)[:2]!r})"
+                validation.issues.append(
+                    "Edit rejected: text inside the edited lines would change "
+                    "unexpectedly." + detail
+                )
+        self._validate_outside_lines(cand_page, page_index, padded, validation)
 
     def _validate_pixels(
         self, before: pymupdf.Pixmap, after: pymupdf.Pixmap,

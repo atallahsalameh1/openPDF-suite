@@ -50,10 +50,12 @@ class DocumentController(QObject):
 
     # editing
     edit_prepared = Signal(dict)  # {ok, validation, preview_png, prepare_key, issues}
+    replace_planned = Signal(dict)  # M10: {ok, batch_key, matches, pages, ...}
+    replace_applied = Signal(dict)  # M10: {ok, revision, pages, replaced, skipped, query}
     snapshot_ready = Signal(str, int, bytes, str)  # doc_id, revision, data, path
     save_failed = Signal(str)
     edit_committed = Signal(int, int)  # revision, page
-    undo_redo_done = Signal(int, bool, bool, int)  # revision, can_undo, can_redo, page
+    undo_redo_done = Signal(int, bool, bool, int, object)  # revision, can_undo, can_redo, page, pages
     saved = Signal(str, str)  # path, fingerprint
     docx_exported = Signal(object)  # DocxExportResult
 
@@ -160,6 +162,23 @@ class DocumentController(QObject):
                           "preview_zoom": preview_zoom},
                          doc_id=self.session.doc_id, revision=self.session.revision)
 
+    def plan_replace_all(self, query: str, replacement: str, match_case: bool = False,
+                         whole_word: bool = False, auto_shrink: bool = False) -> None:
+        """Replace All step 1 (M10): find matches, build page candidates."""
+        assert self.session
+        self.client.send(P.REPLACE_PLAN,
+                         {"query": query, "replacement": replacement,
+                          "match_case": match_case, "whole_word": whole_word,
+                          "auto_shrink": auto_shrink},
+                         doc_id=self.session.doc_id, revision=self.session.revision)
+
+    def apply_replace_all(self, batch_key: str, include_ids: list[int]) -> None:
+        """Replace All step 2 (M10): commit the reviewed pages as one undo group."""
+        assert self.session
+        self.client.send(P.REPLACE_APPLY,
+                         {"batch_key": batch_key, "include_ids": include_ids},
+                         doc_id=self.session.doc_id, revision=self.session.revision)
+
     def commit_edit(self, prepare_key: str) -> None:
         assert self.session
         self.client.send(P.COMMIT_EDIT, {"prepare_key": prepare_key},
@@ -226,6 +245,10 @@ class DocumentController(QObject):
             self._on_prepared(res)
         elif res.kind == P.PREPARE_REDACT:
             self._on_prepared(res)
+        elif res.kind == P.REPLACE_PLAN:
+            self._on_replace_planned(res)
+        elif res.kind == P.REPLACE_APPLY:
+            self._on_replace_applied(res)
         elif res.kind == P.COMMIT_EDIT:
             self._on_committed(res)
         elif res.kind in (P.UNDO, P.REDO):
@@ -358,6 +381,31 @@ class DocumentController(QObject):
         self.cache.invalidate_revision(self.session.doc_id, self.session.revision)
         self.edit_committed.emit(self.session.revision, res.payload["page"])
 
+    def _on_replace_planned(self, res: P.Result) -> None:
+        # plan failures are user feedback (empty query etc.), not crashes
+        if self.session is None or res.doc_id != self.session.doc_id:
+            return
+        payload = dict(res.payload or {})
+        payload["ok"] = res.ok
+        payload["error"] = res.error
+        self.replace_planned.emit(payload)
+
+    def _on_replace_applied(self, res: P.Result) -> None:
+        if self.session is None:
+            self._report(res)
+            return
+        if not res.ok:
+            self._report(res)
+            self.replace_applied.emit({"ok": False, "error": res.error})
+            return
+        payload = dict(res.payload or {})
+        pages = [int(p) for p in payload.get("pages", [])]
+        self.session.mark_committed(int(payload.get("revision", self.session.revision)),
+                                    pages[0] if pages else self.session.current_page)
+        self.cache.invalidate_revision(self.session.doc_id, self.session.revision)
+        payload["ok"] = True
+        self.replace_applied.emit(payload)
+
     def _on_undo_redo(self, res: P.Result) -> None:
         if not res.ok or self.session is None:
             if not res.ok and res.error and "nothing to" in (res.error or ""):
@@ -369,7 +417,8 @@ class DocumentController(QObject):
                                     payload["can_redo"], payload["page"])
         self.cache.invalidate_revision(self.session.doc_id, self.session.revision)
         self.undo_redo_done.emit(payload["revision"], payload["can_undo"],
-                                 payload["can_redo"], payload["page"])
+                                 payload["can_redo"], payload["page"],
+                                 list(payload.get("pages") or [payload["page"]]))
 
     def _on_saved(self, res: P.Result) -> None:
         if not res.ok:
